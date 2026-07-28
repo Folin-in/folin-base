@@ -27,6 +27,8 @@ class AppleHealthSyncRequest(BaseModel):
     active_minutes: Optional[int] = Field(default=None, ge=0, le=24 * 60)
     # Optional day this data corresponds to (YYYY-MM-DD). Server stamps if omitted.
     day: Optional[str] = None
+    # "healthkit" (real device data) or "sample" (demo fallback) - shown in the UI.
+    source: Optional[str] = None
 
 
 def _iso_now() -> str:
@@ -82,6 +84,7 @@ async def sync(req: AppleHealthSyncRequest, current_user: dict = Depends(get_cur
         "active_minutes": req.active_minutes,
         "day": req.day or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "synced_at": _iso_now(),
+        "source": req.source or "sample",
     }
     apple_health = {**ah, "metrics": metrics, "last_synced_at": _iso_now()}
     user = await _save_apple_health(current_user["user_id"], hp, apple_health)
