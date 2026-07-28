@@ -1,0 +1,719 @@
+"""Report routes: AI analysis, listing, detail, delete, biomarker edit - all
+user-scoped and auth-protected. Members-aware (?member_id=self by default)."""
+import asyncio
+import base64
+import json
+import logging
+import os
+import re as _re
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+import cache
+import database as db
+import storage
+from ai_service import build_profile_context, run_ai_analysis
+from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
+                          compute_profile, effective_date, sort_by_effective_date)
+from models import (REPORT_TYPES, AnalyzeRequest, Biomarker, BiomarkerPatch, Medication, Report,
+                    ReportTitleUpdate, Suggestion)
+from rate_limit import check_and_increment_daily_quota, refund_daily_quota
+from routers.members import resolve_member_profile
+from security import get_current_user
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+ALLOWED_MIME = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+SUGGESTION_CATEGORIES = {"nutrition", "movement", "sleep", "supplements", "lifestyle"}
+LEGACY_CATEGORY_MAP = {"diet": "nutrition", "exercise": "movement"}
+# Analysis jobs die after this many seconds so errors can't hang forever.
+ANALYZE_JOB_TIMEOUT_SECS = 180
+
+
+def _normalize_category(cat: str | None) -> str:
+    if not cat:
+        return "lifestyle"
+    cat = cat.strip().lower()
+    cat = LEGACY_CATEGORY_MAP.get(cat, cat)
+    return cat if cat in SUGGESTION_CATEGORIES else "lifestyle"
+
+
+def _valid_id(report_id: str) -> bool:
+    try:
+        uuid.UUID(report_id)
+        return True
+    except ValueError:
+        return False
+
+
+def _member_id_of(member_id: str | None) -> str:
+    return (member_id or "self").strip() or "self"
+
+
+async def _member_reports(user_id: str, member_id: str | None, lab_only: bool = False) -> list[dict]:
+    mid = _member_id_of(member_id)
+    rows = await cache.get_reports(user_id)
+    return [
+        r for r in rows
+        if r.get("member_id", "self") == mid and (not lab_only or r.get("report_type") == "lab")
+    ]
+
+
+async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: dict) -> dict:
+    """The actual AI analyze work. Returns {report_id, report, xp_earned, new_badges, profile}.
+    Extracted so it can run in a background task detached from the request lifecycle.
+    Raises HTTPException on user-facing errors, generic Exception on unexpected failures.
+    """
+    try:
+        raw = base64.b64decode(req.file_base64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file data.")
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB). Try a photo of the report instead of a scan, or compress the PDF.")
+
+    member_id = _member_id_of(req.member_id)
+    display_name, hp = await resolve_member_profile(current_user_snapshot, member_id)
+    language = (hp.get("language") or "english").lower()
+    profile_context = build_profile_context(display_name or current_user_snapshot.get("name", ""), hp)
+
+    existing = sort_by_effective_date(await _member_reports(user_id, member_id))
+    if existing:
+        prev = existing[-1]
+        prev_date = effective_date(prev) or (prev.get("uploaded_at", "")[:10])
+        flagged = [
+            f"{b.get('name')}: {b.get('value')} {b.get('unit', '')} ({b.get('status')})"
+            for b in prev.get("biomarkers", []) if b.get("status") != "normal"
+        ]
+        profile_context += (
+            f" PREVIOUS REPORT ({prev_date}, score {prev.get('health_score')}): "
+            + ("flagged markers were " + "; ".join(flagged) if flagged else "all markers were in range")
+            + ". Compare new values against these where the same marker appears and explicitly mention improvements or declines."
+        )
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ALLOWED_MIME[req.mime_type], delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+
+        try:
+            parsed = await run_ai_analysis(tmp_path, req.mime_type, profile_context, language=language)
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.error(f"AI JSON parse failure: {e}")
+            raise HTTPException(status_code=502, detail="The AI couldn't read this report. Please try again or use a clearer file.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"AI analysis failed: {e}")
+            raise HTTPException(status_code=502, detail="AI analysis failed. Please try again in a moment.")
+
+        report_type = str(parsed.get("report_type") or "").strip().lower()
+        if not report_type and parsed.get("is_blood_report"):
+            report_type = "lab"
+        if report_type == "unknown":
+            raise HTTPException(status_code=400, detail="This doesn't look like a medical document. Try a different file.")
+        if report_type not in REPORT_TYPES:
+            report_type = "lab" if parsed.get("biomarkers") else "other"
+
+        biomarkers = []
+        for b in parsed.get("biomarkers", []):
+            try:
+                biomarkers.append(Biomarker(
+                    name=str(b.get("name", "")).strip(),
+                    value=str(b.get("value", "")).strip(),
+                    unit=str(b.get("unit") or "").strip(),
+                    ref_range=str(b.get("ref_range") or "").strip(),
+                    status=b.get("status") if b.get("status") in STATUS_WEIGHT else "normal",
+                    category=str(b.get("category") or "Other").strip(),
+                    explanation=str(b.get("explanation") or "").strip(),
+                    tip=str(b.get("tip") or "").strip(),
+                ))
+            except Exception:
+                continue
+
+        suggestions = []
+        for s in parsed.get("suggestions", []) or []:
+            try:
+                cat = _normalize_category(s.get("category"))
+                linked = s.get("linked_marker")
+                suggestions.append(Suggestion(
+                    title=str(s.get("title", "")).strip(),
+                    body=str(s.get("body", "")).strip(),
+                    category=cat,
+                    linked_marker=str(linked).strip() if linked else None,
+                ))
+            except Exception:
+                continue
+
+        # BMI from the profile as a first-class marker: shows in the report's marker list,
+        # counts in in-range totals, and feeds the weighted health score like any other test.
+        # Members (sub-profiles) don't carry weight/height, so this is naturally self-only.
+        w, h = hp.get("weight_kg"), hp.get("height_cm")
+        if report_type == "lab" and w and h and not any(b.name.strip().lower() == "bmi" for b in biomarkers):
+            bmi = round(w / ((h / 100) ** 2), 1)
+            if bmi < 17:
+                bmi_status = "low"
+            elif bmi < 18.5:
+                bmi_status = "borderline_low"
+            elif bmi < 25:
+                bmi_status = "normal"
+            elif bmi < 30:
+                bmi_status = "borderline_high"
+            else:
+                bmi_status = "high"
+            biomarkers.append(Biomarker(
+                name="BMI",
+                value=str(bmi),
+                unit="kg/m²",
+                ref_range="18.5 - 24.9",
+                status=bmi_status,
+                category="Other",
+                explanation=f"Body Mass Index, worked out from your profile ({w} kg, {h} cm). It's a rough gauge of weight for your height - not a full picture of health on its own.",
+                tip="This comes from your profile, not the lab report - keep your weight and height up to date there so it stays accurate.",
+            ))
+
+        bio_dicts = [b.model_dump() for b in biomarkers]
+        if report_type == "lab" and bio_dicts:
+            health_score = compute_health_score(bio_dicts)
+        else:
+            positives_raw = [str(p).strip() for p in (parsed.get("positives") or []) if str(p).strip()]
+            concerns_raw = [str(c).strip() for c in (parsed.get("concerns") or []) if str(c).strip()]
+            health_score = compute_document_score(positives_raw, concerns_raw)
+        normal_count = sum(1 for b in bio_dicts if b["status"] == "normal")
+        attention_count = sum(1 for b in bio_dicts if b["status"] in ("high", "low"))
+
+        medications: list[Medication] = []
+        for m in parsed.get("medications") or []:
+            try:
+                name = str(m.get("name") or "").strip()
+                if not name:
+                    continue
+                medications.append(Medication(
+                    name=name,
+                    dose=(str(m["dose"]).strip() if m.get("dose") else None),
+                    schedule=(str(m["schedule"]).strip() if m.get("schedule") else None),
+                    duration=(str(m["duration"]).strip() if m.get("duration") else None),
+                    purpose=(str(m["purpose"]).strip() if m.get("purpose") else None),
+                ))
+            except Exception:
+                continue
+
+        def _str_list(key: str) -> list[str]:
+            v = parsed.get(key) or []
+            # Model occasionally returns a single string instead of a list - iterating it
+            # would produce one-character items.
+            if isinstance(v, str):
+                v = [v]
+            return [str(x).strip() for x in v if str(x).strip()]
+
+        summary_text = _re.sub(r"\s*\(?\b\d{1,3}\s*/\s*100\b\)?", "", str(parsed.get("summary") or "")).strip()
+        lab_or_provider = parsed.get("lab_name") or parsed.get("provider")
+
+        # Keep the original document in Supabase Storage so the user can re-view it.
+        # Best-effort: analysis result is stored either way.
+        storage_path = f"{user_id}/{uuid.uuid4().hex}{ALLOWED_MIME[req.mime_type]}"
+        if not await storage.upload_report_file(storage_path, raw, req.mime_type):
+            storage_path = None
+
+        report = Report(
+            user_id=user_id,
+            member_id=member_id,
+            filename=req.filename,
+            mime_type=req.mime_type,
+            storage_path=storage_path,
+            uploaded_at=datetime.now(timezone.utc).isoformat(),
+            report_type=report_type,
+            report_date=parsed.get("report_date"),
+            patient_name=parsed.get("patient_name"),
+            lab_name=(str(lab_or_provider).strip() if lab_or_provider else None),
+            summary=summary_text,
+            overall_assessment=str(parsed.get("overall_assessment") or ""),
+            positives=_str_list("positives"),
+            concerns=_str_list("concerns"),
+            suggestions=suggestions,
+            biomarkers=biomarkers,
+            health_score=health_score,
+            normal_count=normal_count,
+            attention_count=attention_count,
+            total_count=len(biomarkers),
+            chief_complaint=(str(parsed["chief_complaint"]).strip() if parsed.get("chief_complaint") else None),
+            exam_findings=_str_list("exam_findings"),
+            diagnoses=_str_list("diagnoses"),
+            referrals=_str_list("referrals"),
+            medications=medications,
+            modality=(str(parsed["modality"]).strip() if parsed.get("modality") else None),
+            body_area=(str(parsed["body_area"]).strip() if parsed.get("body_area") else None),
+            findings=_str_list("findings"),
+            impression=(str(parsed["impression"]).strip() if parsed.get("impression") else None),
+            admission_date=parsed.get("admission_date"),
+            discharge_date=parsed.get("discharge_date"),
+            procedures=_str_list("procedures"),
+            follow_up=(str(parsed["follow_up"]).strip() if parsed.get("follow_up") else None),
+        )
+
+        profile_before = compute_profile(existing)
+
+        d = report.model_dump(exclude={"id"})
+        cols = list(d.keys())
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        new_id = await db.fetchval(
+            f"insert into reports ({', '.join(cols)}) values ({placeholders}) returning id",
+            *d.values(),
+        )
+        report.id = str(new_id)
+        cache.invalidate_reports(user_id)
+
+        all_reports = existing + [report.model_dump()]
+        profile_after = compute_profile(all_reports)
+
+        before_ids = {b["id"] for b in profile_before["badges"] if b["unlocked"]}
+        new_badges = [b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids]
+
+        return {
+            "report_id": report.id,
+            "report": report.model_dump(),
+            "xp_earned": profile_after["xp"] - profile_before["xp"],
+            "new_badges": new_badges,
+            "profile": profile_after,
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+async def _run_analyze_job(job_id: str, req: AnalyzeRequest, user_id: str, current_user_snapshot: dict):
+    """Fire-and-forget task. Bounded by ANALYZE_JOB_TIMEOUT_SECS so it can never
+    hang forever. On any failure, marks the job errored AND refunds the daily quota
+    so the user isn't punished for something that never produced a report.
+    """
+    def _iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    try:
+        await db.execute(
+            "update analyze_jobs set status = 'processing', started_at = $1 where job_id = $2", _iso(), job_id
+        )
+        result = await asyncio.wait_for(
+            _do_analyze(req, user_id, current_user_snapshot),
+            timeout=ANALYZE_JOB_TIMEOUT_SECS,
+        )
+        await db.execute(
+            """update analyze_jobs set status = 'success', completed_at = $1, report_id = $2,
+               xp_earned = $3, new_badges = $4, error = null where job_id = $5""",
+            _iso(), result["report_id"], result["xp_earned"], result["new_badges"], job_id,
+        )
+    except asyncio.TimeoutError:
+        await db.execute(
+            "update analyze_jobs set status = 'error', completed_at = $1, error = $2 where job_id = $3",
+            _iso(), "Analysis timed out. Please try again with a clearer file.", job_id,
+        )
+        await refund_daily_quota(user_id)
+    except HTTPException as e:
+        await db.execute(
+            "update analyze_jobs set status = 'error', completed_at = $1, error = $2 where job_id = $3",
+            _iso(), str(e.detail), job_id,
+        )
+        # Refund quota only for retryable errors - unknown-document (400) should still count.
+        if e.status_code >= 500:
+            await refund_daily_quota(user_id)
+    except Exception as e:
+        logger.exception(f"analyze job {job_id} crashed")
+        await db.execute(
+            "update analyze_jobs set status = 'error', completed_at = $1, error = $2 where job_id = $3",
+            _iso(), f"Analysis crashed. Please try again. ({type(e).__name__})", job_id,
+        )
+        await refund_daily_quota(user_id)
+
+
+async def _active_job(user_id: str) -> dict | None:
+    """The user's currently-running analyze job, if any. Jobs older than the server
+    timeout (+ grace) are treated as dead even if a crash left them 'processing' -
+    otherwise a stuck row would block uploads forever."""
+    rows = await db.fetch(
+        """select * from analyze_jobs where user_id = $1 and status in ('pending', 'processing')
+           order by created_at desc limit 5""",
+        user_id,
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ANALYZE_JOB_TIMEOUT_SECS + 60)
+    for r in rows:
+        try:
+            if datetime.fromisoformat(r["created_at"]) > cutoff:
+                return r
+        except ValueError:
+            continue
+    return None
+
+
+@router.get("/analyze/active")
+async def active_analyze_job(current_user: dict = Depends(get_current_user)):
+    """The in-flight analyze job for this user (or {active: false}). Lets the upload
+    screen block new uploads and say which report is still being analyzed."""
+    job = await _active_job(current_user["user_id"])
+    if not job:
+        return {"active": False}
+    return {
+        "active": True,
+        "job_id": job["job_id"],
+        "filename": job["filename"],
+        "member_id": job["member_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+    }
+
+
+@router.post("/analyze")
+async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_current_user)):
+    """Async analyze: creates a job, starts a background task, returns {job_id, status}.
+    Client polls GET /reports/analyze/status/{job_id} until status ∈ {success, error}.
+    Job survives client disconnect and self-times-out after ANALYZE_JOB_TIMEOUT_SECS.
+    One job per user at a time - a second upload while one is running gets a 409.
+    """
+    if req.mime_type not in ALLOWED_MIME:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or a photo (JPG/PNG).")
+    # HARDENING-4: reject oversized payloads BEFORE decoding.
+    # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
+    if len(req.file_base64) > 14 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB). Try a photo of the report instead of a scan, or compress the PDF.")
+
+    # One analysis at a time per user - checked BEFORE burning a quota slot.
+    running = await _active_job(current_user["user_id"])
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"“{running['filename']}” is still being analyzed. Please wait for it to finish before uploading another report.",
+        )
+
+    # spec item #6: env-configurable per-user daily cap on /reports/analyze
+    plan = (current_user.get("preferences") or {}).get("plan") or "free"
+    await check_and_increment_daily_quota(current_user["user_id"], plan)
+
+    job_id = uuid.uuid4().hex[:16]
+    await db.execute(
+        """insert into analyze_jobs (job_id, user_id, member_id, filename, mime_type, status, created_at)
+           values ($1, $2, $3, $4, $5, 'pending', $6)""",
+        job_id, current_user["user_id"], _member_id_of(req.member_id), req.filename, req.mime_type,
+        datetime.now(timezone.utc).isoformat(),
+    )
+    # Snapshot the user so the background task doesn't need to re-fetch (avoids stale-context issues).
+    snapshot = dict(current_user)
+    asyncio.create_task(_run_analyze_job(job_id, req, current_user["user_id"], snapshot))
+    return {"job_id": job_id, "status": "pending"}
+
+
+@router.get("/analyze/status/{job_id}")
+async def analyze_status(job_id: str, current_user: dict = Depends(get_current_user)):
+    """Poll the status of an analyze job. Response shape:
+    {job_id, status: "pending"|"processing"|"success"|"error", report_id?, xp_earned?, new_badges?, error?, created_at, ...}
+    """
+    doc = await db.fetchrow(
+        "select * from analyze_jobs where job_id = $1 and user_id = $2", job_id, current_user["user_id"]
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return doc
+
+
+@router.get("")
+async def list_reports(
+    member_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    # Recency here means "when you uploaded it", not the report's own date - a just-uploaded
+    # old report should still show on top. Trend/compare/streaks keep effective-date order.
+    docs = sorted(
+        await _member_reports(current_user["user_id"], member_id),
+        key=lambda r: r.get("uploaded_at") or "", reverse=True,
+    )
+    out = []
+    for d in docs:
+        r = Report.from_row(d)
+        out.append({
+            "id": r.id, "uploaded_at": r.uploaded_at, "report_date": r.report_date,
+            "lab_name": r.lab_name, "patient_name": r.patient_name, "summary": r.summary,
+            "health_score": r.health_score, "normal_count": r.normal_count,
+            "attention_count": r.attention_count, "total_count": r.total_count,
+            "filename": r.filename, "report_type": r.report_type, "title": r.title,
+            "member_id": r.member_id,
+        })
+    return out
+
+
+@router.get("/suggestions")
+async def list_all_suggestions(
+    member_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    docs = sort_by_effective_date(await _member_reports(current_user["user_id"], member_id), reverse=True)
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    reports_meta: list[dict] = []
+    for d in docs:
+        r = Report.from_row(d)
+        source_title = r.title or _default_report_title(r.report_type)
+        reports_meta.append({
+            "id": r.id,
+            "title": source_title,
+            "report_type": r.report_type,
+            "report_date": r.report_date,
+            "uploaded_at": r.uploaded_at,
+        })
+        for s in r.suggestions or []:
+            key = (s.category or "lifestyle", (s.title or "").strip().lower())
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": s.title,
+                "body": s.body,
+                "category": _normalize_category(s.category),
+                "linked_marker": s.linked_marker,
+                "report_id": r.id,
+                "report_title": source_title,
+                "report_type": r.report_type,
+                "report_date": r.report_date or (r.uploaded_at[:10] if r.uploaded_at else None),
+            })
+    return {"reports": reports_meta, "suggestions": out}
+
+
+RETEST_AFTER_DAYS = 90
+
+
+@router.get("/retest-reminders")
+async def retest_reminders(
+    member_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """PRO feature: markers that were out-of-range in the latest lab report and are due
+    for a retest (report older than RETEST_AFTER_DAYS). Free plan → 403 upsell."""
+    plan = (current_user.get("preferences") or {}).get("plan") or "free"
+    if plan != "pro":
+        raise HTTPException(status_code=403, detail="Retest reminders are a Pro feature. Upgrade to unlock.")
+    docs = sort_by_effective_date(
+        await _member_reports(current_user["user_id"], member_id, lab_only=True), reverse=True
+    )
+    if not docs:
+        return {"due": False, "reminders": []}
+    latest = docs[0]
+    ed = effective_date(latest)
+    try:
+        from datetime import date as _date
+        days_ago = (_date.today() - _date.fromisoformat(ed)).days if ed else None
+    except ValueError:
+        days_ago = None
+    flagged = [b for b in latest.get("biomarkers", []) if b.get("status") != "normal"]
+    due = bool(flagged) and days_ago is not None and days_ago >= RETEST_AFTER_DAYS
+    return {
+        "due": due,
+        "days_since_last": days_ago,
+        "last_report_date": ed,
+        "reminders": [
+            {"name": b.get("name"), "status": b.get("status"), "last_value": b.get("value"),
+             "unit": b.get("unit"), "category": b.get("category")}
+            for b in flagged
+        ] if due else [],
+    }
+
+
+def _default_report_title(report_type: str | None) -> str:
+    return {
+        "lab": "Blood panel",
+        "opd": "Clinic visit",
+        "prescription": "Prescription",
+        "imaging": "Imaging report",
+        "discharge": "Discharge summary",
+        "other": "Medical document",
+    }.get(report_type or "lab", "Medical document")
+
+
+SEVERITY = {"normal": 0, "borderline_high": 1, "borderline_low": 1, "high": 2, "low": 2}
+
+
+def _to_float(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _report_ref(doc: dict) -> dict:
+    return {
+        "id": str(doc["id"]),
+        "report_date": doc.get("report_date"),
+        "uploaded_at": doc.get("uploaded_at"),
+        "lab_name": doc.get("lab_name"),
+        "health_score": doc.get("health_score", 0),
+    }
+
+
+@router.get("/compare")
+async def compare_reports(
+    a: str | None = None,
+    b: str | None = None,
+    against: str | None = None,
+    member_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Compare any two lab reports - both reports must belong to the given member."""
+    docs = sort_by_effective_date(
+        await _member_reports(current_user["user_id"], member_id, lab_only=True), reverse=True
+    )
+    if len(docs) < 2:
+        return {"available": False, "reports_count": len(docs)}
+
+    if a and b:
+        if not _valid_id(a) or not _valid_id(b) or a == b:
+            raise HTTPException(status_code=400, detail="Pick two different reports to compare.")
+        docs_by_id = {str(d["id"]): d for d in docs}
+        latest = docs_by_id.get(a)
+        target = docs_by_id.get(b)
+        if not latest or not target:
+            raise HTTPException(status_code=404, detail="One of the reports isn't a lab report we can compare.")
+        older_docs = [d for d in docs if str(d["id"]) != a]
+    else:
+        latest, older_docs = docs[0], docs[1:]
+        target = None
+        if against and _valid_id(against):
+            target = next((d for d in older_docs if str(d["id"]) == against), None)
+        if target is None:
+            target = older_docs[0]
+
+    old_map = {b.get("name", "").strip().lower(): b for b in target.get("biomarkers", [])}
+    markers, counts = [], {"improved": 0, "worsened": 0, "same": 0}
+    for b in latest.get("biomarkers", []):
+        ob = old_map.get(b.get("name", "").strip().lower())
+        if not ob:
+            continue
+        cur_sev = SEVERITY.get(b.get("status"), 1)
+        old_sev = SEVERITY.get(ob.get("status"), 1)
+        change = "improved" if cur_sev < old_sev else "worsened" if cur_sev > old_sev else "same"
+        counts[change] += 1
+        cv, ov = _to_float(b.get("value")), _to_float(ob.get("value"))
+        markers.append({
+            "name": b.get("name", "").strip(),
+            "unit": b.get("unit", ""),
+            "category": b.get("category", "Other"),
+            "ref_range": b.get("ref_range", ""),
+            "current_value": b.get("value", ""),
+            "previous_value": ob.get("value", ""),
+            "delta": round(cv - ov, 2) if cv is not None and ov is not None else None,
+            "current_status": b.get("status", "normal"),
+            "previous_status": ob.get("status", "normal"),
+            "change": change,
+        })
+    order = {"improved": 0, "worsened": 1, "same": 2}
+    markers.sort(key=lambda m: (order[m["change"]], m["name"]))
+
+    return {
+        "available": True,
+        "latest": _report_ref(latest),
+        "against": _report_ref(target),
+        "older_reports": [_report_ref(d) for d in older_docs],
+        "score_delta": latest.get("health_score", 0) - target.get("health_score", 0),
+        "improved_count": counts["improved"],
+        "worsened_count": counts["worsened"],
+        "same_count": counts["same"],
+        "markers": markers,
+    }
+
+
+@router.get("/{report_id}")
+async def get_report(report_id: str, current_user: dict = Depends(get_current_user)):
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    doc = await db.fetchrow(
+        "select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+    for s in doc.get("suggestions", []) or []:
+        s["category"] = _normalize_category(s.get("category"))
+    out = Report.from_row(doc).model_dump()
+    # Signed URL (1h) to view the original file, when it was stored
+    out["file_url"] = await storage.signed_url(doc["storage_path"]) if doc.get("storage_path") else None
+    return out
+
+
+@router.delete("/{report_id}")
+async def delete_report(report_id: str, current_user: dict = Depends(get_current_user)):
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    path = await db.fetchval(
+        "delete from reports where id = $1::uuid and user_id = $2 returning coalesce(storage_path, '')",
+        report_id, current_user["user_id"],
+    )
+    if path is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    cache.invalidate_reports(current_user["user_id"])
+    if path:
+        await storage.delete_files([path])
+    return {"deleted": True}
+
+
+@router.patch("/{report_id}")
+async def rename_report(
+    report_id: str,
+    req: ReportTitleUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    new_title = req.title.strip()
+    if not new_title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty.")
+    updated = await db.fetchval(
+        "update reports set title = $1 where id = $2::uuid and user_id = $3 returning 1",
+        new_title, report_id, current_user["user_id"],
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Report not found")
+    cache.invalidate_reports(current_user["user_id"])
+    return {"id": report_id, "title": new_title}
+
+
+# ---------- Spec item #4: user-editable biomarkers ----------
+@router.patch("/{report_id}/biomarkers")
+async def edit_biomarker(
+    report_id: str,
+    req: BiomarkerPatch,
+    current_user: dict = Depends(get_current_user),
+):
+    """Correct an OCR mistake on a single biomarker. Sets user_edited=true then
+    recomputes and persists health_score / normal_count / attention_count.
+    Ownership-checked - you can only edit your own reports."""
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    doc = await db.fetchrow(
+        "select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+    biomarkers = list(doc.get("biomarkers") or [])
+    if req.index < 0 or req.index >= len(biomarkers):
+        raise HTTPException(status_code=400, detail="biomarker index out of range")
+    if req.status is not None and req.status not in STATUS_WEIGHT:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
+    b = dict(biomarkers[req.index])
+    if req.value is not None:
+        b["value"] = str(req.value).strip()
+    if req.status is not None:
+        b["status"] = req.status
+    b["user_edited"] = True
+    biomarkers[req.index] = b
+
+    normal_count = sum(1 for x in biomarkers if x.get("status") == "normal")
+    attention_count = sum(1 for x in biomarkers if x.get("status") in ("high", "low"))
+    # Recompute weighted health_score only for lab reports; others keep their existing score.
+    health_score = compute_health_score(biomarkers) if (doc.get("report_type") or "lab") == "lab" else doc["health_score"]
+
+    await db.execute(
+        """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
+           total_count = $4, health_score = $5 where id = $6::uuid""",
+        biomarkers, normal_count, attention_count, len(biomarkers), health_score, report_id,
+    )
+    cache.invalidate_reports(current_user["user_id"])
+    fresh = await db.fetchrow("select * from reports where id = $1::uuid", report_id)
+    return Report.from_row(fresh).model_dump()
