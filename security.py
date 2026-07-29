@@ -84,6 +84,28 @@ async def revoke_all_refresh_tokens(user_id: str) -> None:
     )
 
 
+# ---------- Pro-term expiry ----------
+async def _expire_pro_if_due(user: dict) -> dict:
+    """Pro runs 90 days. Enforced here because every request flows through this - no cron
+    needed; the account downgrades on its first request after the term ends."""
+    prefs = user.get("preferences") or {}
+    expires = prefs.get("plan_expires_at")
+    if prefs.get("plan") != "pro" or not expires:
+        return user
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if expires > now_iso:
+        return user
+    merged = {**prefs, "plan": "free", "plan_changed_at": now_iso, "plan_expires_at": None}
+    await db.execute("update users set preferences = $1 where user_id = $2", merged, user["user_id"])
+    await db.execute(
+        """insert into plan_history (user_id, action, plan, amount_inr, starts_at, expires_at, created_at)
+           values ($1, 'expired', 'free', null, $2, null, $2)""",
+        user["user_id"], now_iso,
+    )
+    cache.invalidate(user["user_id"])
+    return {**user, "preferences": merged}
+
+
 # ---------- Auth dependency (JWT) ----------
 async def get_current_user(request: Request) -> dict:
     auth = request.headers.get("Authorization") or ""
@@ -107,6 +129,6 @@ async def get_current_user(request: Request) -> dict:
         token_tv = int(payload.get("tv") or 0)
         if token_tv < current_tv:
             raise HTTPException(status_code=401, detail="Token revoked. Please sign in again.")
-        return user
+        return await _expire_pro_if_due(user)
 
     raise HTTPException(status_code=401, detail="Invalid or expired token")

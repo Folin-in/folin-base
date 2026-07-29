@@ -144,6 +144,20 @@ create table if not exists quota_counters (
   count int not null default 0
 );
 
+-- Payment / plan audit trail: append-only, one row per plan event (upgrade, downgrade,
+-- expiry). Survives everything except account deletion (FK cascade below).
+create table if not exists plan_history (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  action text not null,          -- upgraded | downgraded | expired
+  plan text not null,            -- resulting plan
+  amount_inr int,                -- charged amount (null for downgrades/expiry)
+  starts_at text not null,
+  expires_at text,               -- pro runs 90 days; null for free
+  created_at text not null
+);
+create index if not exists plan_history_user on plan_history (user_id, created_at desc);
+
 -- Foreign keys (idempotent): child rows die with their user; a pending invite to a
 -- deleted invitee just unlinks. reports.member_id has NO FK on purpose - 'self' is a
 -- virtual member that never exists in the members table.
@@ -170,6 +184,10 @@ begin
       foreign key (a) references users (user_id) on delete cascade;
     alter table family_links add constraint links_b_fk
       foreign key (b) references users (user_id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'plan_history_user_fk') then
+    alter table plan_history add constraint plan_history_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
   end if;
 end $$;
 """

@@ -1,5 +1,5 @@
 """User routes: health profile, preferences, gamification profile, plan, export & delete."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -148,11 +148,15 @@ async def update_preferences(req: PreferencesUpdate, current_user: dict = Depend
 
 
 # ---------- Plan (free / pro) ----------
+PRO_TERM_DAYS = 90
+PRO_PRICE_INR = 299
+
+
 @router.post("/user/plan")
 async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_current_user)):
-    """Switch the user's plan. NOTE: this is a self-serve endpoint used by the in-app
-    "Start Pro trial" upgrade sheet. It does NOT yet charge - payments will be added via
-    Stripe in a follow-up. Downgrades are always allowed.
+    """Switch the user's plan. Pro runs PRO_TERM_DAYS, then auto-expires (checked on every
+    request in get_current_user) - the user re-purchases after that. Every change lands in
+    plan_history. NOTE: self-serve until Stripe; ALLOW_SELF_SERVE_PRO=false blocks upgrades.
     """
     new_plan = (req.plan or "").strip().lower()
     if new_plan not in PLANS:
@@ -162,14 +166,37 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
     # via a verified payment webhook. Downgrades are always allowed.
     if new_plan != "free" and not config.ALLOW_SELF_SERVE_PRO:
         raise HTTPException(status_code=403, detail="Upgrades require payment. Please use the checkout flow.")
+
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(days=PRO_TERM_DAYS)).isoformat() if new_plan == "pro" else None
     merged = {
         **(current_user.get("preferences") or {}),
         "plan": new_plan,
-        "plan_changed_at": datetime.now(timezone.utc).isoformat(),
+        "plan_changed_at": now.isoformat(),
+        "plan_expires_at": expires_at,
     }
     await db.execute("update users set preferences = $1 where user_id = $2", merged, current_user["user_id"])
+    await db.execute(
+        """insert into plan_history (user_id, action, plan, amount_inr, starts_at, expires_at, created_at)
+           values ($1, $2, $3, $4, $5, $6, $5)""",
+        current_user["user_id"],
+        "upgraded" if new_plan == "pro" else "downgraded",
+        new_plan,
+        PRO_PRICE_INR if new_plan == "pro" else None,
+        now.isoformat(),
+        expires_at,
+    )
     cache.invalidate(current_user["user_id"])
     return {**default_preferences(), **merged}
+
+
+@router.get("/user/plan/history")
+async def plan_history(current_user: dict = Depends(get_current_user)):
+    """Full payment / plan audit trail, newest first."""
+    return await db.fetch(
+        "select action, plan, amount_inr, starts_at, expires_at, created_at from plan_history where user_id = $1 order by created_at desc limit 100",
+        current_user["user_id"],
+    )
 
 
 # ---------- Export ----------
