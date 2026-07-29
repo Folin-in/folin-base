@@ -178,6 +178,8 @@ class Report(BaseDocument):
     title: Optional[str] = None
     report_date: Optional[str] = None
     patient_name: Optional[str] = None
+    # True when the patient name on the document doesn't look like the profile it was uploaded to.
+    name_mismatch: bool = False
     # lab_name doubles as the provider name (hospital / clinic / doctor) for non-lab types.
     lab_name: Optional[str] = None
     summary: str = ""

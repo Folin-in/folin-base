@@ -51,6 +51,25 @@ def _valid_id(report_id: str) -> bool:
         return False
 
 
+_NAME_TITLES = {"mr", "mrs", "ms", "miss", "mx", "dr", "master", "shri", "smt", "sri", "kumari", "baby"}
+
+
+def _name_tokens(name: str) -> set[str]:
+    return {t for t in _re.sub(r"[^a-z ]", " ", name.lower()).split() if len(t) > 1 and t not in _NAME_TITLES}
+
+
+def _names_match(profile_name: str | None, patient_name: str | None) -> bool:
+    """Lenient: any shared name token (or substring token) counts as a match. Only a
+    complete disjoint - e.g. profile 'Ketan Raj' vs report 'Sunita Sharma' - is a mismatch.
+    Missing either name = no judgement (returns True)."""
+    a, b = _name_tokens(profile_name or ""), _name_tokens(patient_name or "")
+    if not a or not b:
+        return True
+    if a & b:
+        return True
+    return any(x in y or y in x for x in a for y in b)
+
+
 def _member_id_of(member_id: str | None) -> str:
     return (member_id or "self").strip() or "self"
 
@@ -214,6 +233,9 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
         summary_text = _re.sub(r"\s*\(?\b\d{1,3}\s*/\s*100\b\)?", "", str(parsed.get("summary") or "")).strip()
         lab_or_provider = parsed.get("lab_name") or parsed.get("provider")
 
+        patient_name = parsed.get("patient_name")
+        name_mismatch = not _names_match(display_name, str(patient_name) if patient_name else None)
+
         # Keep the original document in Supabase Storage so the user can re-view it.
         # Best-effort: analysis result is stored either way.
         storage_path = f"{user_id}/{uuid.uuid4().hex}{ALLOWED_MIME[req.mime_type]}"
@@ -229,7 +251,8 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             uploaded_at=datetime.now(timezone.utc).isoformat(),
             report_type=report_type,
             report_date=parsed.get("report_date"),
-            patient_name=parsed.get("patient_name"),
+            patient_name=(str(patient_name).strip() if patient_name else None),
+            name_mismatch=name_mismatch,
             lab_name=(str(lab_or_provider).strip() if lab_or_provider else None),
             summary=summary_text,
             overall_assessment=str(parsed.get("overall_assessment") or ""),
