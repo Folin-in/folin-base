@@ -66,6 +66,8 @@ create index if not exists reports_user_uploaded on reports (user_id, uploaded_a
 alter table reports add column if not exists member_id text not null default 'self';
 alter table users add column if not exists google_id text;
 alter table users add column if not exists apple_id text;
+alter table users add column if not exists consented_at text;
+alter table users add column if not exists consent_version text;
 create table if not exists members (
   member_id text primary key,
   user_id text not null,

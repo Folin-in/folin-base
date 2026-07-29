@@ -115,6 +115,18 @@ async def get_gamification_profile(
     return compute_profile(sort_by_effective_date(docs))
 
 
+# ---------- Consent (social-login users consent post-login; email signups at register) ----------
+@router.post("/user/consent")
+async def give_consent(current_user: dict = Depends(get_current_user)):
+    await db.execute(
+        "update users set consented_at = $1, consent_version = $2 where user_id = $3",
+        datetime.now(timezone.utc).isoformat(), config.CONSENT_VERSION, current_user["user_id"],
+    )
+    cache.invalidate(current_user["user_id"])
+    user = await db.fetchrow("select * from users where user_id = $1", current_user["user_id"])
+    return public_user(user)
+
+
 # ---------- Preferences ----------
 @router.get("/user/preferences")
 async def get_preferences(current_user: dict = Depends(get_current_user)):

@@ -34,6 +34,9 @@ try:
 except ValueError:
     ANALYZE_DAILY_LIMIT = 2
 
+# Health-data consent: bump when the privacy policy materially changes so users re-consent.
+CONSENT_VERSION = os.environ.get("CONSENT_VERSION", "2026-07-29")
+
 # Pro plan commercial terms - env-driven so price/term changes never need a deploy
 PRO_TERM_DAYS = int(os.environ["PRO_TERM_DAYS"])
 PRO_PRICE_INR = int(os.environ["PRO_PRICE_INR"])

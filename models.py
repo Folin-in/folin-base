@@ -17,6 +17,8 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=30, pattern=r"^[a-zA-Z0-9_\.]+$")
     password: str = Field(min_length=6, max_length=128)
     name: str = Field(default="", max_length=80)
+    # Explicit 18+ / health-data consent (DPDP, WA MHMD). Must be true to register.
+    consent: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -70,6 +72,7 @@ def public_user(user: dict) -> dict:
         "auth_provider": user.get("auth_provider", "local"),
         "health_profile": user.get("health_profile") or {},
         "preferences": user.get("preferences") or default_preferences(),
+        "consented_at": user.get("consented_at"),
         "created_at": user.get("created_at"),
     }
 

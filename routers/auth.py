@@ -33,6 +33,8 @@ def _now() -> datetime:
 async def register(req: RegisterRequest, request: Request):
     # SEC-004: block credential-spam
     check_ip_rate_limit(request, bucket="register", max_hits=10, window_seconds=600)
+    if not req.consent:
+        raise HTTPException(status_code=400, detail="Please confirm you're 18+ and consent to health-data processing to create an account.")
     email = req.email.lower().strip()
     username = req.username.lower().strip()
     if await db.fetchval("select 1 from users where email = $1", email):
@@ -52,14 +54,17 @@ async def register(req: RegisterRequest, request: Request):
         "preferences": default_preferences(),
         "token_version": 0,
         "created_at": _now().isoformat(),
+        "consented_at": _now().isoformat(),
+        "consent_version": config.CONSENT_VERSION,
     }
     await db.execute(
         """insert into users (user_id, email, username, name, password_hash, auth_provider,
-                              picture, health_profile, preferences, token_version, created_at)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                              picture, health_profile, preferences, token_version, created_at,
+                              consented_at, consent_version)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)""",
         user["user_id"], user["email"], user["username"], user["name"], user["password_hash"],
         user["auth_provider"], user["picture"], user["health_profile"], user["preferences"],
-        user["token_version"], user["created_at"],
+        user["token_version"], user["created_at"], user["consented_at"], user["consent_version"],
     )
 
     token = create_access_token(user["user_id"], 0)
