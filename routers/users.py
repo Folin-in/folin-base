@@ -148,13 +148,9 @@ async def update_preferences(req: PreferencesUpdate, current_user: dict = Depend
 
 
 # ---------- Plan (free / pro) ----------
-PRO_TERM_DAYS = 90
-PRO_PRICE_INR = 299
-
-
 @router.post("/user/plan")
 async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_current_user)):
-    """Switch the user's plan. Pro runs PRO_TERM_DAYS, then auto-expires (checked on every
+    """Switch the user's plan. Pro runs config.PRO_TERM_DAYS days, then auto-expires (checked on every
     request in get_current_user) - the user re-purchases after that. Every change lands in
     plan_history. NOTE: self-serve until Stripe; ALLOW_SELF_SERVE_PRO=false blocks upgrades.
     """
@@ -168,7 +164,7 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
         raise HTTPException(status_code=403, detail="Upgrades require payment. Please use the checkout flow.")
 
     now = datetime.now(timezone.utc)
-    expires_at = (now + timedelta(days=PRO_TERM_DAYS)).isoformat() if new_plan == "pro" else None
+    expires_at = (now + timedelta(days=config.PRO_TERM_DAYS)).isoformat() if new_plan == "pro" else None
     merged = {
         **(current_user.get("preferences") or {}),
         "plan": new_plan,
@@ -182,7 +178,7 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
         current_user["user_id"],
         "upgraded" if new_plan == "pro" else "downgraded",
         new_plan,
-        PRO_PRICE_INR if new_plan == "pro" else None,
+        config.PRO_PRICE_INR if new_plan == "pro" else None,
         now.isoformat(),
         expires_at,
     )

@@ -34,6 +34,10 @@ try:
 except ValueError:
     ANALYZE_DAILY_LIMIT = 2
 
+# Pro plan commercial terms - env-driven so price/term changes never need a deploy
+PRO_TERM_DAYS = int(os.environ["PRO_TERM_DAYS"])
+PRO_PRICE_INR = int(os.environ["PRO_PRICE_INR"])
+
 # SEC-002: self-serve Pro toggle. TRUE only for preview/demo. In production this MUST be
 # false so plan changes come exclusively from a verified payment webhook (Stripe).
 ALLOW_SELF_SERVE_PRO = os.environ.get("ALLOW_SELF_SERVE_PRO", "true").strip().lower() == "true"
