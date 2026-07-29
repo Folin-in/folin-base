@@ -28,11 +28,10 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SUPABASE_DB_URL = os.environ["SUPABASE_DB_URL"]
 
-# Per-user daily cap on /reports/analyze (spec item #6 - tunable via env)
-try:
-    ANALYZE_DAILY_LIMIT = int(os.environ.get("ANALYZE_DAILY_LIMIT", "2") or "2")
-except ValueError:
-    ANALYZE_DAILY_LIMIT = 2
+# Analysis quotas: free accounts get a TOTAL trial allowance (not per day);
+# Pro gets a daily cap for its 90-day term.
+FREE_TOTAL_ANALYSES = int(os.environ["FREE_TOTAL_ANALYSES"])
+PRO_DAILY_ANALYSES = int(os.environ["PRO_DAILY_ANALYSES"])
 
 # Health-data consent: bump when the privacy policy materially changes so users re-consent.
 CONSENT_VERSION = os.environ.get("CONSENT_VERSION", "2026-07-29")

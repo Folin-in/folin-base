@@ -78,10 +78,9 @@ def check_ip_rate_limit(request: Request, bucket: str, max_hits: int, window_sec
 
 
 # ---------- Postgres-backed daily quota per user ----------
-# Free-tier default reads from config.ANALYZE_DAILY_LIMIT so it can be tuned via env
-# without a code change (spec item #6).
-DAILY_QUOTA_FREE = int(getattr(config, "ANALYZE_DAILY_LIMIT", 10) or 10)
-DAILY_QUOTA_PRO = 10
+# Analyze quota for FREE users is a lifetime total checked in reports.py, not here.
+DAILY_QUOTA_FREE = 20  # generic default for non-analyze buckets without an override
+DAILY_QUOTA_PRO = config.PRO_DAILY_ANALYSES
 
 # Named per-bucket overrides. Buckets that don't appear here use the plan defaults above.
 DAILY_QUOTA_OVERRIDES = {

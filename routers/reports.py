@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import cache
+import config
 import database as db
 import storage
 from ai_service import build_profile_context, run_ai_analysis
@@ -387,9 +388,20 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
             detail=f"“{running['filename']}” is still being analyzed. Please wait for it to finish before uploading another report.",
         )
 
-    # spec item #6: env-configurable per-user daily cap on /reports/analyze
+    # Quotas: free = FREE_TOTAL_ANALYSES total (a trial, not per-day); Pro = daily cap.
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    await check_and_increment_daily_quota(current_user["user_id"], plan)
+    if plan == "pro":
+        await check_and_increment_daily_quota(current_user["user_id"], plan)
+    else:
+        used = await db.fetchval(
+            "select count(*) from analyze_jobs where user_id = $1 and status = 'success'",
+            current_user["user_id"],
+        )
+        if used >= config.FREE_TOTAL_ANALYSES:
+            raise HTTPException(
+                status_code=403,
+                detail=f"You've used your {config.FREE_TOTAL_ANALYSES} free analyses. Upgrade to Pro for {config.PRO_DAILY_ANALYSES} every day.",
+            )
 
     job_id = uuid.uuid4().hex[:16]
     await db.execute(
