@@ -73,7 +73,7 @@ def check_ip_rate_limit(request: Request, bucket: str, max_hits: int, window_sec
     while dq and dq[0] < cutoff:
         dq.popleft()
     if len(dq) >= max_hits:
-        raise HTTPException(status_code=429, detail=f"Too many attempts. Please wait a bit and try again.")
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a bit and try again.")
     dq.append(now)
 
 
