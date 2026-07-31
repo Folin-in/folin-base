@@ -16,13 +16,14 @@ import cache
 import config
 import database as db
 import storage
-from ai_service import build_profile_context, run_ai_analysis
+from ai_service import build_profile_context, run_ai_analysis, verify_biomarkers
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
-from models import (REPORT_TYPES, AnalyzeRequest, Biomarker, BiomarkerPatch, Medication, Report,
-                    ReportTitleUpdate, Suggestion)
+from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, BiomarkerPatch,
+                    Medication, Report, ReportFeedbackIn, ReportTitleUpdate, Suggestion)
 from rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from routers.members import resolve_member_profile
+from sanity import sanity_note
 from security import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,19 @@ SUGGESTION_CATEGORIES = {"nutrition", "movement", "sleep", "supplements", "lifes
 LEGACY_CATEGORY_MAP = {"diet": "nutrition", "exercise": "movement"}
 # Analysis jobs die after this many seconds so errors can't hang forever.
 ANALYZE_JOB_TIMEOUT_SECS = 180
+MAX_ANALYZE_FILES = 5
+
+
+def _req_files(req: AnalyzeRequest) -> list[AnalyzeFileIn]:
+    """Normalize AnalyzeRequest to a list of files (new `files` field or legacy single-file)."""
+    if req.files:
+        return req.files
+    return [AnalyzeFileIn(filename=req.filename, mime_type=req.mime_type, file_base64=req.file_base64)]
+
+
+def _files_display_name(files: list[AnalyzeFileIn]) -> str:
+    first = files[0].filename or "report"
+    return first if len(files) == 1 else f"{first} (+{len(files) - 1} more)"
 
 
 def _normalize_category(cat: str | None) -> str:
@@ -88,12 +102,15 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
     Extracted so it can run in a background task detached from the request lifecycle.
     Raises HTTPException on user-facing errors, generic Exception on unexpected failures.
     """
-    try:
-        raw = base64.b64decode(req.file_base64, validate=False)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid file data.")
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large (max 10 MB). Try a photo of the report instead of a scan, or compress the PDF.")
+    files = _req_files(req)
+    raws: list[bytes] = []
+    for f in files:
+        try:
+            raws.append(base64.b64decode(f.file_base64, validate=False))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid file data.")
+    if sum(len(r) for r in raws) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF.")
 
     member_id = _member_id_of(req.member_id)
     display_name, hp = await resolve_member_profile(current_user_snapshot, member_id)
@@ -114,14 +131,17 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             + ". Compare new values against these where the same marker appears and explicitly mention improvements or declines."
         )
 
-    tmp_path = None
+    tmp_paths: list[str] = []
     try:
-        with tempfile.NamedTemporaryFile(suffix=ALLOWED_MIME[req.mime_type], delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
+        attachments: list[tuple[str, str]] = []
+        for f, raw in zip(files, raws):
+            with tempfile.NamedTemporaryFile(suffix=ALLOWED_MIME[f.mime_type], delete=False) as tmp:
+                tmp.write(raw)
+                tmp_paths.append(tmp.name)
+                attachments.append((tmp.name, f.mime_type))
 
         try:
-            parsed = await run_ai_analysis(tmp_path, req.mime_type, profile_context, language=language)
+            parsed = await run_ai_analysis(attachments, profile_context, language=language)
         except (ValueError, json.JSONDecodeError) as e:
             logger.error(f"AI JSON parse failure: {e}")
             raise HTTPException(status_code=502, detail="The AI couldn't read this report. Please try again or use a clearer file.")
@@ -154,6 +174,32 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
                 ))
             except Exception:
                 continue
+
+        # Sanity guardrails (free, instant): flag implausible values / status-range contradictions.
+        for b in biomarkers:
+            note = sanity_note(b.model_dump())
+            if note:
+                b.needs_verification = True
+                b.verification_note = note
+
+        # PRO self-check: second AI pass cross-checks every value/status against the document.
+        plan = ((current_user_snapshot.get("preferences") or {}).get("plan")) or "free"
+        if plan == "pro" and biomarkers:
+            try:
+                mismatches = await verify_biomarkers(attachments, [b.model_dump() for b in biomarkers])
+                by_name = {str(m.get("name", "")).strip().lower(): m for m in mismatches}
+                for b in biomarkers:
+                    m = by_name.get(b.name.strip().lower())
+                    if m:
+                        b.needs_verification = True
+                        issue = str(m.get("issue") or "").strip()
+                        expected = str(m.get("expected") or "").strip()
+                        b.verification_note = (
+                            (issue or "This value may not match the document - please double-check.")
+                            + (f" (Document shows: {expected})" if expected else "")
+                        )[:300]
+            except Exception as e:
+                logger.warning(f"AI self-check failed (skipping): {e}")
 
         suggestions = []
         for s in parsed.get("suggestions", []) or []:
@@ -237,16 +283,21 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
         name_mismatch = not _names_match(display_name, str(patient_name) if patient_name else None)
 
         # Keep the original document in Supabase Storage so the user can re-view it.
-        # Best-effort: analysis result is stored either way.
-        storage_path = f"{user_id}/{uuid.uuid4().hex}{ALLOWED_MIME[req.mime_type]}"
-        if not await storage.upload_report_file(storage_path, raw, req.mime_type):
-            storage_path = None
+        # Best-effort: analysis result is stored either way. Multi-page uploads store
+        # every page; paths are comma-joined in the single storage_path text column
+        # (paths are "<uuid>/<hex><ext>" - never contain commas).
+        stored_paths: list[str] = []
+        for f, raw in zip(files, raws):
+            page_path = f"{user_id}/{uuid.uuid4().hex}{ALLOWED_MIME[f.mime_type]}"
+            if await storage.upload_report_file(page_path, raw, f.mime_type):
+                stored_paths.append(page_path)
+        storage_path = ",".join(stored_paths) or None
 
         report = Report(
             user_id=user_id,
             member_id=member_id,
-            filename=req.filename,
-            mime_type=req.mime_type,
+            filename=_files_display_name(files),
+            mime_type=files[0].mime_type,
             storage_path=storage_path,
             uploaded_at=datetime.now(timezone.utc).isoformat(),
             report_type=report_type,
@@ -305,8 +356,9 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             "profile": profile_after,
         }
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        for p in tmp_paths:
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 async def _run_analyze_job(job_id: str, req: AnalyzeRequest, user_id: str, current_user_snapshot: dict):
@@ -396,12 +448,18 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     Job survives client disconnect and self-times-out after ANALYZE_JOB_TIMEOUT_SECS.
     One job per user at a time - a second upload while one is running gets a 409.
     """
-    if req.mime_type not in ALLOWED_MIME:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or a photo (JPG/PNG).")
+    files = _req_files(req)
+    if len(files) > MAX_ANALYZE_FILES:
+        raise HTTPException(status_code=400, detail=f"You can upload at most {MAX_ANALYZE_FILES} photos at once.")
+    if len(files) > 1 and any(not f.mime_type.startswith("image/") for f in files):
+        raise HTTPException(status_code=400, detail="Multi-page upload works with photos only. Upload PDFs one at a time.")
+    for f in files:
+        if f.mime_type not in ALLOWED_MIME:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or a photo (JPG/PNG).")
     # HARDENING-4: reject oversized payloads BEFORE decoding.
     # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
-    if len(req.file_base64) > 14 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large (max 10 MB). Try a photo of the report instead of a scan, or compress the PDF.")
+    if sum(len(f.file_base64) for f in files) > 14 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF.")
 
     # One analysis at a time per user - checked BEFORE burning a quota slot.
     running = await _active_job(current_user["user_id"])
@@ -430,8 +488,8 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     await db.execute(
         """insert into analyze_jobs (job_id, user_id, member_id, filename, mime_type, status, created_at)
            values ($1, $2, $3, $4, $5, 'pending', $6)""",
-        job_id, current_user["user_id"], _member_id_of(req.member_id), req.filename, req.mime_type,
-        datetime.now(timezone.utc).isoformat(),
+        job_id, current_user["user_id"], _member_id_of(req.member_id), _files_display_name(files),
+        files[0].mime_type, datetime.now(timezone.utc).isoformat(),
     )
     # Snapshot the user so the background task doesn't need to re-fetch (avoids stale-context issues).
     snapshot = dict(current_user)
@@ -667,8 +725,12 @@ async def get_report(report_id: str, current_user: dict = Depends(get_current_us
     for s in doc.get("suggestions", []) or []:
         s["category"] = _normalize_category(s.get("category"))
     out = Report.from_row(doc).model_dump()
-    # Signed URL (1h) to view the original file, when it was stored
-    out["file_url"] = await storage.signed_url(doc["storage_path"]) if doc.get("storage_path") else None
+    # Signed URLs (1h) to view the original file(s), when stored. Multi-page uploads
+    # keep comma-joined paths; file_url stays the first page for older clients.
+    paths = [p for p in (doc.get("storage_path") or "").split(",") if p]
+    urls = [u for u in [await storage.signed_url(p) for p in paths] if u]
+    out["file_url"] = urls[0] if urls else None
+    out["file_urls"] = urls
     return out
 
 
@@ -684,7 +746,7 @@ async def delete_report(report_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Report not found")
     cache.invalidate_reports(current_user["user_id"])
     if path:
-        await storage.delete_files([path])
+        await storage.delete_files(path.split(","))
     return {"deleted": True}
 
 
@@ -737,6 +799,9 @@ async def edit_biomarker(
     if req.status is not None:
         b["status"] = req.status
     b["user_edited"] = True
+    # The user just looked at this value - clear any verification flag.
+    b["needs_verification"] = False
+    b["verification_note"] = None
     biomarkers[req.index] = b
 
     normal_count = sum(1 for x in biomarkers if x.get("status") == "normal")
@@ -752,3 +817,59 @@ async def edit_biomarker(
     cache.invalidate_reports(current_user["user_id"])
     fresh = await db.fetchrow("select * from reports where id = $1::uuid", report_id)
     return Report.from_row(fresh).model_dump()
+
+
+# ---------- Accuracy feedback: "Is this analysis correct?" ----------
+FEEDBACK_ISSUES = {"wrong_value", "missed_marker", "wrong_status", "bad_tip", "wrong_language", "other"}
+
+
+@router.post("/{report_id}/feedback")
+async def submit_report_feedback(
+    report_id: str,
+    req: ReportFeedbackIn,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record thumbs-up/down on a report (biomarker_index=null) or a single biomarker.
+    One entry per (report, biomarker_index) - resubmitting overwrites."""
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    doc = await db.fetchrow(
+        "select biomarkers from reports where id = $1::uuid and user_id = $2",
+        report_id, current_user["user_id"],
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+    issues = [i for i in req.issues if i in FEEDBACK_ISSUES]
+    if not req.correct and not issues and not req.note.strip():
+        raise HTTPException(status_code=400, detail="Tell us what's wrong - pick an issue or add a note.")
+    biomarker_name = None
+    if req.biomarker_index is not None:
+        markers = doc.get("biomarkers") or []
+        if req.biomarker_index >= len(markers):
+            raise HTTPException(status_code=400, detail="biomarker index out of range")
+        biomarker_name = markers[req.biomarker_index].get("name")
+    now = datetime.now(timezone.utc).isoformat()
+    fb_id = f"{report_id}:{req.biomarker_index if req.biomarker_index is not None else 'report'}"
+    await db.execute(
+        """insert into report_feedback (id, user_id, report_id, biomarker_index, biomarker_name,
+             correct, issues, note, created_at, updated_at)
+           values ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $9)
+           on conflict (id) do update set correct = $6, issues = $7, note = $8,
+             biomarker_name = $5, updated_at = $9""",
+        fb_id, current_user["user_id"], report_id, req.biomarker_index, biomarker_name,
+        req.correct, issues, req.note.strip(), now,
+    )
+    return {"ok": True}
+
+
+@router.get("/{report_id}/feedback")
+async def get_report_feedback(report_id: str, current_user: dict = Depends(get_current_user)):
+    if not _valid_id(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report id")
+    rows = await db.fetch(
+        """select report_id, biomarker_index, biomarker_name, correct, issues, note,
+             created_at, updated_at
+           from report_feedback where report_id = $1::uuid and user_id = $2""",
+        report_id, current_user["user_id"],
+    )
+    return [{**r, "report_id": str(r["report_id"])} for r in rows]

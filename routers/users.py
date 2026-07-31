@@ -229,8 +229,10 @@ async def export_user_data(current_user: dict = Depends(get_current_user)):
 @router.delete("/user/account")
 async def delete_account(current_user: dict = Depends(get_current_user)):
     user_id = current_user["user_id"]
-    paths = [r["storage_path"] for r in await db.fetch(
-        "select storage_path from reports where user_id = $1 and storage_path is not null", user_id)]
+    # storage_path is comma-joined for multi-page uploads - flatten to individual paths.
+    paths = [p for r in await db.fetch(
+        "select storage_path from reports where user_id = $1 and storage_path is not null", user_id)
+        for p in r["storage_path"].split(",") if p]
     await storage.delete_files(paths)
     # Foreign-key cascades take out reports, members, tokens, resets, jobs, quotas and family rows.
     await db.execute("delete from users where user_id = $1", user_id)

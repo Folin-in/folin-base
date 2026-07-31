@@ -136,6 +136,16 @@ class Biomarker(BaseModel):
     tip: str = ""
     # (spec item #4) Marks values the user corrected after AI OCR.
     user_edited: bool = False
+    # Accuracy features: set by sanity guardrails (free) or the Pro AI self-check.
+    needs_verification: bool = False
+    verification_note: Optional[str] = None
+
+
+class ReportFeedbackIn(BaseModel):
+    correct: bool
+    issues: List[str] = []
+    note: str = Field(default="", max_length=500)
+    biomarker_index: Optional[int] = Field(default=None, ge=0)
 
 
 class BiomarkerPatch(BaseModel):
@@ -212,10 +222,18 @@ class Report(BaseDocument):
     follow_up: Optional[str] = None
 
 
-class AnalyzeRequest(BaseModel):
-    filename: str
+class AnalyzeFileIn(BaseModel):
+    filename: str = ""
     mime_type: str
     file_base64: str
+
+
+class AnalyzeRequest(BaseModel):
+    # Legacy single-file fields (still accepted). New clients send `files` (1-5 items).
+    filename: str = ""
+    mime_type: str = ""
+    file_base64: str = ""
+    files: Optional[List[AnalyzeFileIn]] = None
     member_id: Optional[str] = None  # spec #11 - defaults to "self" on the server
 
 

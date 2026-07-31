@@ -55,6 +55,8 @@ COMMON fields (fill what applies, else null):
    * AGE CONTEXT: Younger adults (<30) - emphasise habit-building. 30-50 - emphasise long-term risk reduction. >50 - emphasise strength, balance, and gentle progressions.
    * INDIAN-FIRST FOODS (spec item #10): Ground every diet suggestion in foods commonly available in India - dal, chana, rajma, paneer, curd/dahi, ghee (in moderation), ragi, jowar, bajra, oats, millets, seasonal Indian fruit/veg (spinach/palak, methi, lauki, bhindi, tomato, guava, papaya, banana, orange, amla). Eggs/fish/chicken only when the diet is non-vegetarian. NEVER recommend exotic/premium items (quinoa, kale, salmon, avocado, chia, blueberries) without naming an everyday Indian equivalent in the SAME sentence (e.g., "salmon - or in India, use rohu / mackerel", "kale - or use palak/methi", "quinoa - or use ragi/millets"). Frame meals around Indian patterns (dal-chawal, roti-sabzi, curd-rice, poha, upma, idli/dosa, khichdi).
    * For non-lab documents, suggestions should ONLY be lifestyle/self-care that COMPLEMENTS the doctor's treatment plan. NEVER contradict prescribed medication or replace medical advice.
+   * RECOMMEND, NEVER COMMAND: Phrase EVERY tip, suggestion and piece of advice as a friendly recommendation or option - "you could try...", "it may help to...", "consider adding...", "aap chahein toh ... kar sakte hain", "... try kar sakte hain". NEVER use orders or imperative instructions ("do this", "eat X", "take X", "stop Y", "avoid Z", "...karo", "...daalo", "...khao", "...band karo"). The user decides; you only suggest. Anything touching medication, supplements or dosage must explicitly defer to their doctor.
+   * HIGHLIGHT KEY ACTIONS: In every suggestion "body" and every biomarker "tip", wrap the 1-3 most important foods, actions or quantities in **double asterisks** so the app can highlight them (e.g. "Dal, sabzi, roti mein **namak thoda kam** rakhne ki koshish kar sakte hain", "aap **palak ya methi** hafte mein do baar add kar sakte hain", "dinner ke baad **20 minute walk** try kar sakte hain"). Keep each highlighted phrase short (2-6 words). Do NOT wrap whole sentences and do NOT use any other markdown anywhere.
 
 LAB-report-SPECIFIC fields (only when report_type == "lab"):
   "biomarkers": [ { "name","value","unit","ref_range","status","category","explanation","tip" }, ... ]
@@ -84,7 +86,7 @@ Return JSON only. Do NOT include markdown fences."""
 HINGLISH_ADDENDUM = """
 
 LANGUAGE OVERRIDE - HINGLISH MODE (spec item #9):
-The user prefers Hinglish. Write "summary", "overall_assessment", every biomarker "explanation" and "tip", every suggestion "body", and the strings inside "positives"/"concerns" in casual Hinglish (Hindi in Roman script mixed with English). Keep ALL medical terms, marker names, category names, units, dates, and structural JSON keys in English exactly as specified. Tone: calm, friendly, warm - like an elder cousin explaining a lab report over chai. Never slangy or dismissive about serious findings. Examples: "Aapka cholesterol thoda high hai - chinta ki baat nahi, thodi walking aur oats se manage ho jayega.", "HbA1c normal range mein hai - accha kaam, isse aise hi maintain karo." Field names ("summary", "biomarkers", "category", "status", etc.) MUST remain English/JSON-spec. Do NOT use Devanagari script - Roman letters only."""
+The user prefers Hinglish. Write "summary", "overall_assessment", every biomarker "explanation" and "tip", every suggestion "body", and the strings inside "positives"/"concerns" in casual Hinglish (Hindi in Roman script mixed with English). Keep ALL medical terms, marker names, category names, units, dates, and structural JSON keys in English exactly as specified. Tone: calm, friendly, warm - like an elder cousin explaining a lab report over chai. Never slangy or dismissive about serious findings. Examples: "Aapka cholesterol thoda high hai - chinta ki baat nahi, thodi walking aur oats se manage ho sakta hai.", "HbA1c normal range mein hai - accha kaam, ise aise hi maintain kar sakte hain." Remember: suggest, never order - use "kar sakte hain / try kar sakte hain / chahein toh", never "karo / daalo / khao". Field names ("summary", "biomarkers", "category", "status", etc.) MUST remain English/JSON-spec. Do NOT use Devanagari script - Roman letters only."""
 
 # Native-script language addenda. Each writes narrative fields in that language while
 # preserving marker names, units, categories and JSON structural keys in English.
@@ -191,20 +193,20 @@ def _build_system_prompt(language: str) -> str:
     return SYSTEM_PROMPT_BASE
 
 
-async def run_ai_analysis(file_path: str, mime_type: str, profile_context: str, language: str = "english") -> dict:
-    with open(file_path, "rb") as f:
-        file_b64 = base64.b64encode(f.read()).decode()
+async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str, user_text: str) -> dict:
+    """Send a document (1 file of any supported type, or 2-5 image pages) + prompt to Gemini
+    as ONE multimodal message and return the parsed JSON."""
+    parts = []
+    for file_path, mime_type in files:
+        with open(file_path, "rb") as f:
+            file_b64 = base64.b64encode(f.read()).decode()
+        parts.append({"inline_data": {"mime_type": mime_type, "data": file_b64}})
+    parts.append({"text": user_text})
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.GEMINI_MODEL}:generateContent"
     body = {
-        "system_instruction": {"parts": [{"text": _build_system_prompt(language)}]},
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"inline_data": {"mime_type": mime_type, "data": file_b64}},
-                {"text": f"Analyze this medical document and return JSON matching the correct report_type. {profile_context}"},
-            ],
-        }],
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": parts}],
         # temperature 0: deterministic extraction - the same document should always
         # produce the same markers, statuses and score.
         "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
@@ -214,3 +216,33 @@ async def run_ai_analysis(file_path: str, mime_type: str, profile_context: str, 
     resp.raise_for_status()
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     return _extract_json(text)
+
+
+async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str, language: str = "english") -> dict:
+    """files: list of (file_path, mime_type). Multiple files are pages of ONE document
+    (images only - enforced upstream in the router)."""
+    page_note = (
+        f" The document is provided as {len(files)} photos - treat them as consecutive pages of "
+        "ONE single report and merge all findings into one result."
+        if len(files) > 1 else ""
+    )
+    text = f"Analyze this medical document and return JSON matching the correct report_type.{page_note} {profile_context}"
+    return await _gemini_document_call(files, _build_system_prompt(language), text)
+
+
+VERIFY_SYSTEM_PROMPT = """You are a meticulous lab-report proofreader. You are given a medical document and a JSON list of biomarkers previously extracted from it. Re-read the document carefully and check EVERY entry: (1) the value matches what is printed, (2) the unit matches, (3) the status (normal/high/low/borderline_high/borderline_low) is consistent with the printed reference range.
+Respond with ONLY JSON: {"mismatches": [{"name": "<exact biomarker name from the list>", "issue": "<one short plain-language sentence about what looks wrong>", "expected": "<what the document actually shows, if readable>"}]}. If everything checks out, return {"mismatches": []}. Only report REAL discrepancies you are confident about - never nitpick formatting, rounding, or synonyms."""
+
+
+async def verify_biomarkers(files: list[tuple[str, str]], biomarkers: list[dict]) -> list[dict]:
+    """PRO self-check: second AI pass that cross-checks the extraction against the document.
+    Returns a list of {name, issue, expected} mismatches (may be empty)."""
+    compact = [
+        {"name": b.get("name"), "value": b.get("value"), "unit": b.get("unit"),
+         "ref_range": b.get("ref_range"), "status": b.get("status")}
+        for b in biomarkers
+    ]
+    text = "Verify this extraction against the attached document:\n" + json.dumps(compact, ensure_ascii=False)
+    parsed = await _gemini_document_call(files, VERIFY_SYSTEM_PROMPT, text)
+    out = parsed.get("mismatches") or []
+    return [m for m in out if isinstance(m, dict) and m.get("name")]

@@ -161,6 +161,22 @@ create table if not exists plan_history (
 );
 create index if not exists plan_history_user on plan_history (user_id, created_at desc);
 
+-- Accuracy feedback: one row per (report, biomarker) - biomarker_index null = whole report.
+-- id encodes the uniqueness key so upserts are a plain on-conflict.
+create table if not exists report_feedback (
+  id text primary key,               -- "<report_id>:<biomarker_index|report>"
+  user_id text not null,
+  report_id uuid not null,
+  biomarker_index int,
+  biomarker_name text,
+  correct boolean not null,
+  issues jsonb not null default '[]',
+  note text not null default '',
+  created_at text not null,
+  updated_at text not null
+);
+create index if not exists report_feedback_report on report_feedback (report_id);
+
 -- Foreign keys (idempotent): child rows die with their user; a pending invite to a
 -- deleted invitee just unlinks. reports.member_id has NO FK on purpose - 'self' is a
 -- virtual member that never exists in the members table.
@@ -191,6 +207,12 @@ begin
   if not exists (select 1 from pg_constraint where conname = 'plan_history_user_fk') then
     alter table plan_history add constraint plan_history_user_fk
       foreign key (user_id) references users (user_id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'report_feedback_user_fk') then
+    alter table report_feedback add constraint report_feedback_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
+    alter table report_feedback add constraint report_feedback_report_fk
+      foreign key (report_id) references reports (id) on delete cascade;
   end if;
 end $$;
 """
