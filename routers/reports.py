@@ -762,12 +762,21 @@ async def rename_report(
     new_title = req.title.strip()
     if not new_title:
         raise HTTPException(status_code=400, detail="Title cannot be empty.")
-    updated = await db.fetchval(
-        "update reports set title = $1 where id = $2::uuid and user_id = $3 returning 1",
-        new_title, report_id, current_user["user_id"],
+    row = await db.fetchrow(
+        "select title from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
     )
-    if not updated:
+    if not row:
         raise HTTPException(status_code=404, detail="Report not found")
+    old_title = row["title"]
+    await db.execute(
+        "update reports set title = $1 where id = $2::uuid", new_title, report_id
+    )
+    await db.execute(
+        """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
+           values ($1, $2::uuid, 'title', $3, $4, $5)""",
+        current_user["user_id"], report_id, {"title": old_title}, {"title": new_title},
+        datetime.now(timezone.utc).isoformat(),
+    )
     cache.invalidate_reports(current_user["user_id"])
     return {"id": report_id, "title": new_title}
 
@@ -795,6 +804,7 @@ async def edit_biomarker(
     if req.status is not None and req.status not in STATUS_WEIGHT:
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
     b = dict(biomarkers[req.index])
+    old_value, old_status = b.get("value"), b.get("status")
     if req.value is not None:
         b["value"] = str(req.value).strip()
     if req.status is not None:
@@ -814,6 +824,16 @@ async def edit_biomarker(
         """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
            total_count = $4, health_score = $5 where id = $6::uuid""",
         biomarkers, normal_count, attention_count, len(biomarkers), health_score, report_id,
+    )
+    # Audit trail: the pre-edit value survives so an admin can always see what the
+    # AI showed vs what the user changed it to.
+    await db.execute(
+        """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
+           values ($1, $2::uuid, $3, $4, $5, $6)""",
+        current_user["user_id"], report_id, f"biomarker:{b.get('name', '')}",
+        {"value": old_value, "status": old_status},
+        {"value": b["value"], "status": b["status"]},
+        datetime.now(timezone.utc).isoformat(),
     )
     cache.invalidate_reports(current_user["user_id"])
     fresh = await db.fetchrow("select * from reports where id = $1::uuid", report_id)

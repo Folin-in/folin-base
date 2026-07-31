@@ -177,6 +177,20 @@ create table if not exists report_feedback (
 );
 create index if not exists report_feedback_report on report_feedback (report_id);
 
+-- Audit trail for user edits to a report (biomarker corrections, renames).
+-- Append-only: the AI's original value survives every edit, so an admin can always
+-- reconstruct what was shown vs what the user changed it to, and when.
+create table if not exists report_edits (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  report_id uuid not null,
+  field text not null,           -- 'biomarker:<name>' | 'title'
+  old_value jsonb not null,      -- e.g. {"value": "12", "status": "low"}
+  new_value jsonb not null,
+  edited_at text not null
+);
+create index if not exists report_edits_report on report_edits (report_id, edited_at desc);
+
 -- Foreign keys (idempotent): child rows die with their user; a pending invite to a
 -- deleted invitee just unlinks. reports.member_id has NO FK on purpose - 'self' is a
 -- virtual member that never exists in the members table.
@@ -207,6 +221,12 @@ begin
   if not exists (select 1 from pg_constraint where conname = 'plan_history_user_fk') then
     alter table plan_history add constraint plan_history_user_fk
       foreign key (user_id) references users (user_id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'report_edits_user_fk') then
+    alter table report_edits add constraint report_edits_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
+    alter table report_edits add constraint report_edits_report_fk
+      foreign key (report_id) references reports (id) on delete cascade;
   end if;
   if not exists (select 1 from pg_constraint where conname = 'report_feedback_user_fk') then
     alter table report_feedback add constraint report_feedback_user_fk
