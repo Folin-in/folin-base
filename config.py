@@ -19,9 +19,12 @@ JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30").strip('"') or "30")
 
-# Gemini (medical document analysis)
+# Gemini (medical document analysis). GEMINI_MODELS is a comma-separated priority
+# list - the agent tries each in order and fails over automatically on any error.
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ["GEMINI_MODEL"]
+GEMINI_MODELS = [m.strip() for m in os.environ["GEMINI_MODELS"].split(",") if m.strip()]
+if not GEMINI_MODELS:
+    raise RuntimeError("GEMINI_MODELS must list at least one model")
 
 # Supabase: Storage (original uploaded report files) + Postgres (all app data)
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
