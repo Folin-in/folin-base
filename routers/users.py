@@ -17,6 +17,7 @@ router = APIRouter(tags=["users"])
 VALID_APPEARANCE = {"light", "dark", "system"}
 VALID_NOTIFICATIONS = {"off", "weekly", "daily"}
 VALID_UNITS = {"us", "si"}
+VALID_REGIONS = {"india", "other"}
 
 
 @router.put("/user/health-profile")
@@ -192,6 +193,10 @@ async def update_preferences(req: PreferencesUpdate, current_user: dict = Depend
         if req.units not in VALID_UNITS:
             raise HTTPException(status_code=400, detail=f"units must be one of {sorted(VALID_UNITS)}")
         updates["preferences.units"] = req.units
+    if req.region is not None:
+        if req.region not in VALID_REGIONS:
+            raise HTTPException(status_code=400, detail=f"region must be one of {sorted(VALID_REGIONS)}")
+        updates["preferences.region"] = req.region
 
     if updates:
         merged = {**(current_user.get("preferences") or {}), **{k.split(".")[1]: v for k, v in updates.items()}}

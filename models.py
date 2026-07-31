@@ -80,7 +80,8 @@ def public_user(user: dict) -> dict:
 DEFAULT_PREFS = {
     "appearance": "light",           # light | dark | system
     "notifications": "weekly",       # off | weekly | daily
-    "units": "us",                   # us (mg/dL) | si (mmol/L)
+    "units": "us",                   # us (mg/dL) | si (mmol/L) - lab values only
+    "region": "india",               # india | other - drives weight/height input units
     "plan": "free",                  # free | pro
 }
 
@@ -94,6 +95,7 @@ class PreferencesUpdate(BaseModel):
     appearance: Optional[str] = None
     notifications: Optional[str] = None
     units: Optional[str] = None
+    region: Optional[str] = None
 
 
 PLANS = {"free", "pro"}
