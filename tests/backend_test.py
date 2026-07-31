@@ -1,4 +1,4 @@
-"""VitalQuest backend tests - Iteration 3 (Auth + user-scoping + health profile).
+"""Folin backend tests - Iteration 3 (Auth + user-scoping + health profile).
 
 - Uses public URL from /app/frontend/.env
 - Registers a fresh throwaway user per session for auth-scoping tests

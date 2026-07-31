@@ -1,4 +1,4 @@
-"""VitalQuest API - app assembly."""
+"""Folin API - app assembly."""
 import logging
 
 from fastapi import APIRouter, FastAPI
@@ -11,14 +11,14 @@ from routers import auth, family, members, reports, users
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="VitalQuest API")
+app = FastAPI(title="Folin API")
 
 api_router = APIRouter(prefix="/api")
 
 
 @api_router.get("/")
 async def root():
-    return {"message": "VitalQuest API", "status": "ok"}
+    return {"message": "Folin API", "status": "ok"}
 
 
 api_router.include_router(auth.router)

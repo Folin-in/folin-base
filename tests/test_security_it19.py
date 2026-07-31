@@ -139,7 +139,7 @@ class TestSEC001EmailEscape:
         very_long_name = "A" * 500
         _, payload = self._invoke(monkeypatch, very_long_name)
         subject = payload["subject"]
-        # name is capped at 60 + " invited you to VitalQuest" suffix
+        # name is capped at 60 + " invited you to Folin" suffix
         assert len(subject) <= 120
 
 

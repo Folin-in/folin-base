@@ -39,24 +39,24 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
     safe_email = _html.escape((invitee_email or "").strip()[:254], quote=True)
     safe_rel = _html.escape((relationship or "family").capitalize()[:20], quote=True)
     subject_name = (inviter_name or "Someone").strip().replace("\r", " ").replace("\n", " ")[:60]
-    subject = f"{subject_name} invited you to VitalQuest"
+    subject = f"{subject_name} invited you to Folin"
     html = f"""
     <!DOCTYPE html>
     <html>
       <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#F4F4F6; padding:24px; margin:0;">
         <div style="max-width:520px;margin:0 auto;background:#FFFFFF;border-radius:20px;padding:32px 28px;">
           <div style="text-align:center;">
-            <div style="display:inline-block;background:#FDE4CE;color:#B04B0F;font-weight:800;padding:10px 14px;border-radius:16px;font-size:18px;">VitalQuest</div>
+            <div style="display:inline-block;background:#FDE4CE;color:#B04B0F;font-weight:800;padding:10px 14px;border-radius:16px;font-size:18px;">Folin</div>
           </div>
           <h1 style="font-size:22px;color:#17181A;margin:24px 0 8px 0;letter-spacing:-0.4px;">
             {safe_name} invited you to share health scores
           </h1>
           <p style="font-size:14px;color:#5A5F6A;line-height:22px;margin:0 0 20px 0;">
-            They'd like you to be part of their <strong>{safe_rel}</strong> circle on VitalQuest. You'll never see raw lab values, only the summary score.
+            They'd like you to be part of their <strong>{safe_rel}</strong> circle on Folin. You'll never see raw lab values, only the summary score.
           </p>
           <div style="text-align:center;margin:28px 0 20px;">
             <a href="{invite_link}" style="display:inline-block;background:#F1580C;color:#FFFFFF;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:999px;font-size:15px;">
-              Open VitalQuest
+              Open Folin
             </a>
           </div>
           <p style="font-size:13px;color:#5A5F6A;line-height:20px;margin:0 0 6px 0;">
@@ -93,18 +93,18 @@ def send_password_reset(to_email: str, code: str) -> bool:
     if not smtp_enabled():
         logger.info(f"[email] SMTP not configured - skipping reset email to {to_email}")
         return False
-    subject = f"Your VitalQuest password reset code: {code}"
+    subject = f"Your Folin password reset code: {code}"
     text = (
-        f"Your VitalQuest reset code is: {code}\n\n"
+        f"Your Folin reset code is: {code}\n\n"
         "This code is valid for 15 minutes and can only be used once. If you didn't request "
-        "this, you can safely ignore this email.\n\n- VitalQuest"
+        "this, you can safely ignore this email.\n\n- Folin"
     )
     html = f"""
     <!DOCTYPE html>
     <html>
       <body style="font-family:-apple-system,'Segoe UI',sans-serif;background:#F4F4F6;padding:24px;margin:0;">
         <div style="max-width:480px;margin:0 auto;background:#FFF;border-radius:20px;padding:32px 28px;">
-          <div style="text-align:center;background:#FDE4CE;color:#B04B0F;font-weight:800;padding:10px 14px;border-radius:16px;font-size:18px;display:inline-block;">VitalQuest</div>
+          <div style="text-align:center;background:#FDE4CE;color:#B04B0F;font-weight:800;padding:10px 14px;border-radius:16px;font-size:18px;display:inline-block;">Folin</div>
           <h1 style="font-size:20px;color:#17181A;margin:24px 0 8px 0;">Reset your password</h1>
           <p style="font-size:14px;color:#5A5F6A;line-height:22px;margin:0 0 20px 0;">Enter this code in the app to set a new password. It expires in 15 minutes.</p>
           <div style="text-align:center;font-size:32px;font-weight:800;letter-spacing:8px;color:#17181A;background:#F4F4F6;padding:18px 8px;border-radius:14px;">{_html.escape(code)}</div>
