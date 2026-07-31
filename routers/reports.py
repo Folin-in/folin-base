@@ -16,7 +16,8 @@ import cache
 import config
 import database as db
 import storage
-from ai_service import build_profile_context, run_ai_analysis, verify_biomarkers
+from ai_agent import run_ai_analysis, verify_biomarkers
+from ai_tools import build_profile_context
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
 from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, BiomarkerPatch,

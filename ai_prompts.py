@@ -1,18 +1,6 @@
-"""AI analysis of ANY medical document via the Gemini API, personalized with
-the user's or family-member's health profile.
-
-Model is configurable via env GEMINI_MODEL (see config.py).
+"""Every prompt the AI agent uses lives here - and ONLY here.
+ai_agent.py holds the call logic, ai_tools.py the helpers; neither embeds prompt text.
 """
-import base64
-import json
-import logging
-import re
-
-import httpx
-
-import config
-
-logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_BASE = """You are VitalQuest's medical document analyzer. You analyze ANY kind of medical document (lab report, OPD/clinic visit note, prescription, imaging report, discharge summary) that a user uploads (PDF or photo) and return ONLY strict JSON - no markdown fences, no commentary.
 
@@ -118,72 +106,7 @@ LANGUAGE_ADDENDA: dict = {
 }
 
 
-WORKOUT_LABELS = {
-    "walking": "walking / light cardio",
-    "cardio": "running / cardio",
-    "strength": "gym / strength training",
-    "yoga": "yoga",
-    "sports": "sports",
-    "mixed": "mixed training",
-}
-DIET_LABELS = {"vegetarian": "vegetarian", "non_vegetarian": "non-vegetarian", "vegan": "vegan"}
-
-
-def build_profile_context(name: str, hp: dict) -> str:
-    parts = []
-    if name:
-        parts.append(f"Name: {name}")
-    if hp.get("age"):
-        parts.append(f"Age: {hp['age']} years")
-    if hp.get("gender"):
-        parts.append(f"Gender: {hp['gender']}")
-    w, h = hp.get("weight_kg"), hp.get("height_cm")
-    if w:
-        parts.append(f"Weight: {w} kg")
-    if h:
-        parts.append(f"Height: {h} cm")
-    if w and h:
-        bmi = round(w / ((h / 100) ** 2), 1)
-        parts.append(f"BMI: {bmi}")
-    if hp.get("workout") is True:
-        wt = WORKOUT_LABELS.get(hp.get("workout_type") or "", hp.get("workout_type") or "regular exercise")
-        parts.append(f"Works out regularly: {wt} - match this in movement tips")
-    elif hp.get("workout") is False:
-        parts.append("Does NOT currently work out - suggest very gentle starts only (walks, stretches, no gym advice)")
-    diet = hp.get("diet")
-    if diet:
-        diet_label = DIET_LABELS.get(diet, diet)
-        if diet == "vegetarian":
-            parts.append("Diet: vegetarian - NO meat, chicken, fish or seafood in ANY food suggestion. Eggs and dairy are OK.")
-        elif diet == "vegan":
-            parts.append("Diet: vegan - plant-based only. NO meat, fish, dairy, eggs, honey. Suggest tofu/tempeh/legumes/nuts/seeds/plant milk.")
-        else:
-            parts.append(f"Diet: {diet_label} - lean meats, fish and eggs are OK to suggest.")
-    # Allergies - strict lock. Every entry MUST be avoided in every nutrition / supplement recommendation.
-    allergies = [str(a).strip() for a in (hp.get("allergies") or []) if str(a).strip()]
-    if allergies:
-        parts.append(
-            "STRICT ALLERGIES (never suggest these foods, ingredients, or supplements, not even as an alternative): "
-            + ", ".join(allergies)
-        )
-    if not parts:
-        return "No user profile provided - give general adult recommendations."
-    header = (
-        "USER PROFILE - you MUST personalize every suggestion to THIS person. Reference their diet, "
-        "workout habit, age, or BMI in the suggestion body. Never violate their diet: "
-    )
-    return header + "; ".join(parts) + "."
-
-
-def _extract_json(text: str) -> dict:
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("No JSON object found in model response")
-    return json.loads(text[start:end + 1])
-
-
-def _build_system_prompt(language: str) -> str:
+def build_system_prompt(language: str) -> str:
     lang = (language or "english").lower().strip()
     if lang == "hinglish":
         return SYSTEM_PROMPT_BASE + HINGLISH_ADDENDUM
@@ -193,56 +116,5 @@ def _build_system_prompt(language: str) -> str:
     return SYSTEM_PROMPT_BASE
 
 
-async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str, user_text: str) -> dict:
-    """Send a document (1 file of any supported type, or 2-5 image pages) + prompt to Gemini
-    as ONE multimodal message and return the parsed JSON."""
-    parts = []
-    for file_path, mime_type in files:
-        with open(file_path, "rb") as f:
-            file_b64 = base64.b64encode(f.read()).decode()
-        parts.append({"inline_data": {"mime_type": mime_type, "data": file_b64}})
-    parts.append({"text": user_text})
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.GEMINI_MODEL}:generateContent"
-    body = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": parts}],
-        # temperature 0: deterministic extraction - the same document should always
-        # produce the same markers, statuses and score.
-        "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, json=body, headers={"x-goog-api-key": config.GEMINI_API_KEY})
-    resp.raise_for_status()
-    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return _extract_json(text)
-
-
-async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str, language: str = "english") -> dict:
-    """files: list of (file_path, mime_type). Multiple files are pages of ONE document
-    (images only - enforced upstream in the router)."""
-    page_note = (
-        f" The document is provided as {len(files)} photos - treat them as consecutive pages of "
-        "ONE single report and merge all findings into one result."
-        if len(files) > 1 else ""
-    )
-    text = f"Analyze this medical document and return JSON matching the correct report_type.{page_note} {profile_context}"
-    return await _gemini_document_call(files, _build_system_prompt(language), text)
-
-
 VERIFY_SYSTEM_PROMPT = """You are a meticulous lab-report proofreader. You are given a medical document and a JSON list of biomarkers previously extracted from it. Re-read the document carefully and check EVERY entry: (1) the value matches what is printed, (2) the unit matches, (3) the status (normal/high/low/borderline_high/borderline_low) is consistent with the printed reference range.
 Respond with ONLY JSON: {"mismatches": [{"name": "<exact biomarker name from the list>", "issue": "<one short plain-language sentence about what looks wrong>", "expected": "<what the document actually shows, if readable>"}]}. If everything checks out, return {"mismatches": []}. Only report REAL discrepancies you are confident about - never nitpick formatting, rounding, or synonyms."""
-
-
-async def verify_biomarkers(files: list[tuple[str, str]], biomarkers: list[dict]) -> list[dict]:
-    """PRO self-check: second AI pass that cross-checks the extraction against the document.
-    Returns a list of {name, issue, expected} mismatches (may be empty)."""
-    compact = [
-        {"name": b.get("name"), "value": b.get("value"), "unit": b.get("unit"),
-         "ref_range": b.get("ref_range"), "status": b.get("status")}
-        for b in biomarkers
-    ]
-    text = "Verify this extraction against the attached document:\n" + json.dumps(compact, ensure_ascii=False)
-    parsed = await _gemini_document_call(files, VERIFY_SYSTEM_PROMPT, text)
-    out = parsed.get("mismatches") or []
-    return [m for m in out if isinstance(m, dict) and m.get("name")]
