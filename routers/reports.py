@@ -24,6 +24,7 @@ from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, Biom
                     Medication, Report, ReportFeedbackIn, ReportTitleUpdate, Suggestion)
 from rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from routers.members import resolve_member_profile
+from routers.users import fetch_events
 from sanity import sanity_note
 from security import get_current_user
 
@@ -331,7 +332,8 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             follow_up=(str(parsed["follow_up"]).strip() if parsed.get("follow_up") else None),
         )
 
-        profile_before = compute_profile(existing)
+        events = await fetch_events(user_id)
+        profile_before = compute_profile(existing, events=events)
 
         d = report.model_dump(exclude={"id"})
         cols = list(d.keys())
@@ -344,7 +346,7 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
         cache.invalidate_reports(user_id)
 
         all_reports = existing + [report.model_dump()]
-        profile_after = compute_profile(all_reports)
+        profile_after = compute_profile(all_reports, events=events)
 
         before_ids = {b["id"] for b in profile_before["badges"] if b["unlocked"]}
         new_badges = [b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids]

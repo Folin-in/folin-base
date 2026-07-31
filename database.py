@@ -191,6 +191,19 @@ create table if not exists report_edits (
 );
 create index if not exists report_edits_report on report_edits (report_id, edited_at desc);
 
+-- Engagement events: behaviour signals the gamification engine scores (profile
+-- completed, explanation read, follow-up logged). Append-only; farming is limited
+-- at scoring time (EVENT_ONCE / EVENT_DAILY_CAP in gamification.py).
+create table if not exists engagement_events (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  type text not null,
+  report_id text,
+  ref text,
+  at text not null
+);
+create index if not exists engagement_events_user on engagement_events (user_id, at);
+
 -- Foreign keys (idempotent): child rows die with their user; a pending invite to a
 -- deleted invitee just unlinks. reports.member_id has NO FK on purpose - 'self' is a
 -- virtual member that never exists in the members table.
@@ -227,6 +240,10 @@ begin
       foreign key (user_id) references users (user_id) on delete cascade;
     alter table report_edits add constraint report_edits_report_fk
       foreign key (report_id) references reports (id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'engagement_events_user_fk') then
+    alter table engagement_events add constraint engagement_events_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
   end if;
   if not exists (select 1 from pg_constraint where conname = 'report_feedback_user_fk') then
     alter table report_feedback add constraint report_feedback_user_fk

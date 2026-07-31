@@ -7,7 +7,7 @@ import cache
 import config
 import database as db
 import storage
-from gamification import compute_profile, sort_by_effective_date
+from gamification import EVENT_XP, compute_profile, sort_by_effective_date
 from models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, HealthProfileUpdate,
                     PlanChangeRequest, PreferencesUpdate, default_preferences, public_user)
 from security import get_current_user, revoke_all_refresh_tokens
@@ -90,6 +90,16 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
                 raise HTTPException(status_code=409, detail="That username is already taken.")
             updates["username"] = new_username
 
+    if "health_profile" in updates:
+        hp_new = updates["health_profile"]
+        now = datetime.now(timezone.utc).isoformat()
+        # Auto-events (once each, enforced here AND at scoring time): completing the
+        # profile / declaring allergies is behaviour the gamification engine rewards.
+        if all(hp_new.get(k) for k in ("age", "weight_kg", "height_cm", "diet")) and hp_new.get("workout") is not None:
+            await _record_event_once(current_user["user_id"], "profile_completed", now)
+        if hp_new.get("allergies"):
+            await _record_event_once(current_user["user_id"], "allergies_declared", now)
+
     if updates:
         sets = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(updates))
         # If email was changed, revoke all previously issued tokens (SEC-003), including
@@ -104,6 +114,39 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
     return public_user(user)
 
 
+async def _record_event_once(user_id: str, etype: str, at: str) -> None:
+    """Insert a once-only engagement event unless one already exists."""
+    exists = await db.fetchval(
+        "select 1 from engagement_events where user_id = $1 and type = $2 limit 1", user_id, etype
+    )
+    if not exists:
+        await db.execute(
+            "insert into engagement_events (user_id, type, at) values ($1, $2, $3)", user_id, etype, at
+        )
+
+
+async def fetch_events(user_id: str) -> list[dict]:
+    return await db.fetch(
+        "select type, report_id, ref, at from engagement_events where user_id = $1", user_id
+    )
+
+
+@router.post("/user/events")
+async def record_engagement_event(payload: dict, current_user: dict = Depends(get_current_user)):
+    """Record a behaviour signal from the app (e.g. explanation_read, followup_logged).
+    XP farming is bounded at scoring time (EVENT_ONCE / EVENT_DAILY_CAP)."""
+    etype = str(payload.get("type") or "")
+    if etype not in EVENT_XP:
+        raise HTTPException(status_code=400, detail=f"type must be one of {sorted(EVENT_XP)}")
+    report_id = (str(payload.get("report_id")) if payload.get("report_id") else None)
+    ref = (str(payload.get("ref"))[:80] if payload.get("ref") else None)
+    await db.execute(
+        "insert into engagement_events (user_id, type, report_id, ref, at) values ($1, $2, $3, $4, $5)",
+        current_user["user_id"], etype, report_id, ref, datetime.now(timezone.utc).isoformat(),
+    )
+    return {"ok": True}
+
+
 @router.get("/profile")
 async def get_gamification_profile(
     member_id: str | None = None,
@@ -112,7 +155,7 @@ async def get_gamification_profile(
     mid = (member_id or "self").strip() or "self"
     rows = await cache.get_reports(current_user["user_id"])
     docs = [r for r in rows if r.get("member_id", "self") == mid]
-    return compute_profile(sort_by_effective_date(docs))
+    return compute_profile(sort_by_effective_date(docs), events=await fetch_events(current_user["user_id"]))
 
 
 # ---------- Consent (social-login users consent post-login; email signups at register) ----------
