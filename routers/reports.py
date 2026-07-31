@@ -2,6 +2,7 @@
 user-scoped and auth-protected. Members-aware (?member_id=self by default)."""
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -294,6 +295,7 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             if await storage.upload_report_file(page_path, raw, f.mime_type):
                 stored_paths.append(page_path)
         storage_path = ",".join(stored_paths) or None
+        file_hash = hashlib.sha256(b"".join(raws)).hexdigest()
 
         report = Report(
             user_id=user_id,
@@ -301,6 +303,7 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             filename=_files_display_name(files),
             mime_type=files[0].mime_type,
             storage_path=storage_path,
+            file_hash=file_hash,
             uploaded_at=datetime.now(timezone.utc).isoformat(),
             report_type=report_type,
             report_date=parsed.get("report_date"),
@@ -463,6 +466,28 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
     if sum(len(f.file_base64) for f in files) > 14 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF.")
+
+    # Duplicate detection: the same bytes analyzed twice can score differently
+    # (the second run sees previous-report context), which reads as a bug and
+    # wastes quota. Same document for the same member -> point at the existing report.
+    digest = hashlib.sha256()
+    for f in files:
+        try:
+            digest.update(base64.b64decode(f.file_base64, validate=False))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid file data.")
+    file_hash = digest.hexdigest()
+    dup = await db.fetchrow(
+        """select id, uploaded_at from reports
+           where user_id = $1 and member_id = $2 and file_hash = $3 limit 1""",
+        current_user["user_id"], _member_id_of(req.member_id), file_hash,
+    )
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail=f"You already analyzed this exact document on {str(dup['uploaded_at'])[:10]}. "
+                   "Open it from the Reports tab, or delete it first to re-analyze.",
+        )
 
     # One analysis at a time per user - checked BEFORE burning a quota slot.
     running = await _active_job(current_user["user_id"])
@@ -807,6 +832,11 @@ async def edit_biomarker(
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
     b = dict(biomarkers[req.index])
     old_value, old_status = b.get("value"), b.get("status")
+    # First edit pins the AI-read original on the marker itself (report_edits keeps
+    # the full history); later edits never overwrite it.
+    if b.get("original_value") is None:
+        b["original_value"] = old_value
+        b["original_status"] = old_status
     if req.value is not None:
         b["value"] = str(req.value).strip()
     if req.status is not None:

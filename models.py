@@ -141,6 +141,9 @@ class Biomarker(BaseModel):
     # Accuracy features: set by sanity guardrails (free) or the Pro AI self-check.
     needs_verification: bool = False
     verification_note: Optional[str] = None
+    # First-edit snapshot: the AI-read value/status survive every user edit.
+    original_value: Optional[str] = None
+    original_status: Optional[str] = None
 
 
 class ReportFeedbackIn(BaseModel):
@@ -183,6 +186,8 @@ class Report(BaseDocument):
     mime_type: str = ""
     # Path of the original file in Supabase Storage (None for legacy/failed uploads)
     storage_path: Optional[str] = None
+    # sha256 of the uploaded bytes - blocks accidental duplicate uploads of the same document
+    file_hash: Optional[str] = None
     uploaded_at: str = ""
     # Universal medical document type - defaults to "lab" for backward compat.
     report_type: str = "lab"
