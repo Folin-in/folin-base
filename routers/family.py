@@ -10,6 +10,7 @@ from email_service import send_family_invite
 from gamification import compute_profile
 from models import FamilyInviteRequest, RELATIONSHIPS
 from rate_limit import check_and_increment_daily_quota
+from routers.users import fetch_events
 from security import get_current_user
 
 router = APIRouter(prefix="/family", tags=["family"])
@@ -26,7 +27,9 @@ async def _member_summary(user_id: str) -> dict:
         return {}
     rows = await cache.get_reports(user_id)
     docs = sorted(rows, key=lambda r: r.get("uploaded_at") or "", reverse=True)[:20]
-    profile = compute_profile(rows)
+    # Same inputs as the profile tab - omitting events made XP/badges diverge
+    # between the family view and the member's own profile screen.
+    profile = compute_profile(rows, events=await fetch_events(user_id))
     latest = docs[0] if docs else None
     return {
         "user_id": user_id,
