@@ -480,6 +480,10 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     for f in files:
         if f.mime_type not in ALLOWED_MIME:
             raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or a photo (JPG/PNG).")
+        # An empty or truncated payload can never be a readable report. Reject it here
+        # rather than let it occupy the one-job-per-user slot and fail 20s later.
+        if len(f.file_base64 or "") < 512:
+            raise HTTPException(status_code=400, detail="That file looks empty or corrupted. Please pick the file again.")
     # HARDENING-4: reject oversized payloads BEFORE decoding.
     # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
     if sum(len(f.file_base64) for f in files) > 14 * 1024 * 1024:
@@ -513,7 +517,8 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     if running:
         raise HTTPException(
             status_code=409,
-            detail=f"“{running['filename']}” is still being analyzed. Please wait for it to finish before uploading another report.",
+            detail=f"“{running['filename']}” is still being analyzed. It'll finish in under a minute - "
+                   "your new report can go up right after.",
         )
 
     # Quotas: free = FREE_TOTAL_ANALYSES total (a trial, not per-day); Pro = daily cap.
