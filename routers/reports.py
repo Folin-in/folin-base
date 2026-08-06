@@ -559,6 +559,18 @@ async def analyze_status(job_id: str, current_user: dict = Depends(get_current_u
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Job not found")
+    # A process restart mid-job leaves the row 'processing' with nothing to finish
+    # it, so the client polled forever. Report it as failed once it is older than
+    # the server timeout + grace (same window _active_job uses to unblock uploads).
+    if doc.get("status") in ("pending", "processing"):
+        try:
+            started = datetime.fromisoformat(doc["created_at"])
+            if datetime.now(timezone.utc) - started > timedelta(seconds=ANALYZE_JOB_TIMEOUT_SECS + 60):
+                doc = dict(doc)
+                doc["status"] = "error"
+                doc["error"] = "That analysis was interrupted. Please try uploading again."
+        except ValueError:
+            pass
     return doc
 
 
@@ -734,6 +746,9 @@ def _default_report_title(report_type: str | None) -> str:
 
 
 SEVERITY = {"normal": 0, "borderline_high": 1, "borderline_low": 1, "high": 2, "low": 2}
+# Reports whose score reflects measured biology. A prescription photo scores 65 by
+# heuristic; letting it set "your health score" made the number drop for no reason.
+SCORING_TYPES = {"lab"}
 
 
 def _to_float(v):
@@ -936,7 +951,8 @@ async def edit_biomarker(
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
     doc = await db.fetchrow(
-        "select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
+        "select * from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
+        report_id, current_user["user_id"]
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -1037,7 +1053,7 @@ async def submit_report_feedback(
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
     doc = await db.fetchrow(
-        "select biomarkers from reports where id = $1::uuid and user_id = $2",
+        "select biomarkers from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
         report_id, current_user["user_id"],
     )
     if not doc:

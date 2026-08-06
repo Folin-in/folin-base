@@ -116,9 +116,13 @@ async def update_member(member_id: str, req: MemberUpsertRequest, current_user: 
 async def delete_member(member_id: str, current_user: dict = Depends(get_current_user)):
     if member_id == "self":
         raise HTTPException(status_code=400, detail="You can't delete yourself.")
-    # Also delete the member's reports so the user doesn't have invisible data lying around.
+    # Soft-delete the member's reports, matching DELETE /reports/{id}. Hard-deleting
+    # them orphaned their files in Storage forever (account deletion reads paths from
+    # this table), and made an accidental member delete unrecoverable.
     await db.execute(
-        "delete from reports where user_id = $1 and member_id = $2", current_user["user_id"], member_id
+        """update reports set deleted_at = $3
+           where user_id = $1 and member_id = $2 and deleted_at is null""",
+        current_user["user_id"], member_id, datetime.now(timezone.utc).isoformat(),
     )
     cache.invalidate_reports(current_user["user_id"])
     deleted = await db.fetchval(
