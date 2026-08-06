@@ -27,7 +27,7 @@ from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, Biom
 from rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from routers.members import resolve_member_profile
 from routers.users import fetch_events
-from sanity import sanity_note
+from sanity import _parse_range as _parse_ref_bounds, sanity_note
 from security import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -653,6 +653,9 @@ async def list_all_suggestions(
     #    (e.g. meat advice after switching to vegetarian). Cached by a hash of the
     #    tips + profile, so any change in either produces a fresh verdict; fails
     #    open to the unfiltered list.
+    # NEVER block the screen on the AI: a cold cache used to cost ~37s of spinner.
+    # Apply a cached verdict instantly; otherwise serve unfiltered now and compute
+    # the verdict in the background so the next view has it.
     if len(out) >= 2:
         ctx = build_profile_context(display_name or current_user.get("name", ""), hp)
         key = hashlib.sha256(
@@ -660,13 +663,20 @@ async def list_all_suggestions(
         ).hexdigest()
         drop = cache.get_tips_verdict(key)
         if drop is None:
-            try:
-                drop = await reconcile_tips(ctx, out, meta={"kind": "reconcile_tips", "user_id": current_user["user_id"]})
-            except Exception as e:
-                logger.warning(f"tips reconcile failed (serving unfiltered): {e}")
-                drop = []
-            cache.set_tips_verdict(key, drop)
-        if drop:
+            snapshot = list(out)
+            uid = current_user["user_id"]
+
+            async def _warm_verdict():
+                try:
+                    verdict = await reconcile_tips(ctx, snapshot,
+                                                   meta={"kind": "reconcile_tips", "user_id": uid})
+                except Exception as e:
+                    logger.warning(f"tips reconcile failed (leaving unfiltered): {e}")
+                    verdict = []
+                cache.set_tips_verdict(key, verdict)
+
+            asyncio.create_task(_warm_verdict())
+        elif drop:
             dropset = set(drop)
             out = [t for i, t in enumerate(out) if i not in dropset]
 
@@ -733,6 +743,23 @@ def _to_float(v):
         return None
 
 
+def _range_distance(value, ref_range: str):
+    """How far a value sits OUTSIDE its printed reference range (0 when in range).
+    Lets compare tell 'drifted further out' from 'came back toward range' when the
+    status band itself didn't change."""
+    v = _to_float(value)
+    if v is None:
+        return None
+    lo, hi = _parse_ref_bounds(ref_range)
+    if lo is None and hi is None:
+        return None
+    if lo is not None and v < lo:
+        return lo - v
+    if hi is not None and v > hi:
+        return v - hi
+    return 0.0
+
+
 def _report_ref(doc: dict) -> dict:
     return {
         "id": str(doc["id"]),
@@ -783,7 +810,19 @@ async def compare_reports(
             continue
         cur_sev = SEVERITY.get(b.get("status"), 1)
         old_sev = SEVERITY.get(ob.get("status"), 1)
-        change = "improved" if cur_sev < old_sev else "worsened" if cur_sev > old_sev else "same"
+        if cur_sev != old_sev:
+            change = "improved" if cur_sev < old_sev else "worsened"
+        else:
+            # Same status band. A flagged marker that drifted further outside its
+            # range had been reported as "same" (e.g. HbA1c 5.5 -> 5.9, both
+            # borderline high) - compare distance from the range instead.
+            ref = b.get("ref_range") or ob.get("ref_range") or ""
+            cur_d = _range_distance(b.get("value"), ref)
+            old_d = _range_distance(ob.get("value"), ref)
+            if cur_sev == 0 or cur_d is None or old_d is None or cur_d == old_d:
+                change = "same"   # in range, or unparseable, or genuinely unchanged
+            else:
+                change = "improved" if cur_d < old_d else "worsened"
         counts[change] += 1
         cv, ov = _to_float(b.get("value")), _to_float(ob.get("value"))
         markers.append({
