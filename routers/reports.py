@@ -882,6 +882,7 @@ async def edit_biomarker(
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
     b = dict(biomarkers[req.index])
     old_value, old_status = b.get("value"), b.get("status")
+    old_tip, old_explanation = b.get("tip"), b.get("explanation")
     # First edit pins the AI-read original on the marker itself (report_edits keeps
     # the full history); later edits never overwrite it.
     if b.get("original_value") is None:
@@ -940,12 +941,14 @@ async def edit_biomarker(
     )
     # Audit trail: the pre-edit value survives so an admin can always see what the
     # AI showed vs what the user changed it to.
+    # Audit captures the ADVICE alongside the numbers: when the tip/explanation
+    # were regenerated for the new value, the pre-edit text survives here.
     await db.execute(
         """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
            values ($1, $2::uuid, $3, $4, $5, $6)""",
         current_user["user_id"], report_id, f"biomarker:{b.get('name', '')}",
-        {"value": old_value, "status": old_status},
-        {"value": b["value"], "status": b["status"]},
+        {"value": old_value, "status": old_status, "tip": old_tip, "explanation": old_explanation},
+        {"value": b["value"], "status": b["status"], "tip": b.get("tip"), "explanation": b.get("explanation")},
         datetime.now(timezone.utc).isoformat(),
     )
     cache.invalidate_reports(current_user["user_id"])
