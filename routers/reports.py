@@ -144,8 +144,10 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
                 tmp_paths.append(tmp.name)
                 attachments.append((tmp.name, f.mime_type))
 
+        analyze_meta: dict = {"kind": "analyze", "user_id": user_id}
+        verify_meta: dict = {}
         try:
-            parsed = await run_ai_analysis(attachments, profile_context, language=language)
+            parsed = await run_ai_analysis(attachments, profile_context, language=language, meta=analyze_meta)
         except (ValueError, json.JSONDecodeError) as e:
             logger.error(f"AI JSON parse failure: {e}")
             raise HTTPException(status_code=502, detail="The AI couldn't read this report. Please try again or use a clearer file.")
@@ -189,8 +191,9 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
         # PRO self-check: second AI pass cross-checks every value/status against the document.
         plan = ((current_user_snapshot.get("preferences") or {}).get("plan")) or "free"
         if plan == "pro" and biomarkers:
+            verify_meta.update({"kind": "verify", "user_id": user_id})
             try:
-                mismatches = await verify_biomarkers(attachments, [b.model_dump() for b in biomarkers])
+                mismatches = await verify_biomarkers(attachments, [b.model_dump() for b in biomarkers], meta=verify_meta)
                 by_name = {str(m.get("name", "")).strip().lower(): m for m in mismatches}
                 for b in biomarkers:
                     m = by_name.get(b.name.strip().lower())
@@ -347,6 +350,20 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             *d.values(),
         )
         report.id = str(new_id)
+        # Provenance: which model analyzed this report + a link to the full trajectory.
+        if analyze_meta.get("trajectory_id"):
+            await db.execute(
+                "update reports set analysis_meta = $1 where id = $2::uuid",
+                {"model": analyze_meta.get("model"), "trajectory_id": analyze_meta["trajectory_id"]},
+                report.id,
+            )
+            await db.execute(
+                "update ai_trajectories set report_id = $1 where id = $2",
+                report.id, analyze_meta["trajectory_id"],
+            )
+        if verify_meta.get("trajectory_id"):
+            await db.execute("update ai_trajectories set report_id = $1 where id = $2",
+                             report.id, verify_meta["trajectory_id"])
         cache.invalidate_reports(user_id)
 
         all_reports = existing + [report.model_dump()]
@@ -463,6 +480,10 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     for f in files:
         if f.mime_type not in ALLOWED_MIME:
             raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or a photo (JPG/PNG).")
+        # An empty or truncated payload can never be a readable report. Reject it here
+        # rather than let it occupy the one-job-per-user slot and fail 20s later.
+        if len(f.file_base64 or "") < 512:
+            raise HTTPException(status_code=400, detail="That file looks empty or corrupted. Please pick the file again.")
     # HARDENING-4: reject oversized payloads BEFORE decoding.
     # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
     if sum(len(f.file_base64) for f in files) > 14 * 1024 * 1024:
@@ -480,7 +501,8 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     file_hash = digest.hexdigest()
     dup = await db.fetchrow(
         """select id, uploaded_at from reports
-           where user_id = $1 and member_id = $2 and file_hash = $3 limit 1""",
+           where user_id = $1 and member_id = $2 and file_hash = $3
+           and deleted_at is null limit 1""",
         current_user["user_id"], _member_id_of(req.member_id), file_hash,
     )
     if dup:
@@ -495,7 +517,8 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
     if running:
         raise HTTPException(
             status_code=409,
-            detail=f"“{running['filename']}” is still being analyzed. Please wait for it to finish before uploading another report.",
+            detail=f"“{running['filename']}” is still being analyzed. It'll finish in under a minute - "
+                   "your new report can go up right after.",
         )
 
     # Quotas: free = FREE_TOTAL_ANALYSES total (a trial, not per-day); Pro = daily cap.
@@ -638,7 +661,7 @@ async def list_all_suggestions(
         drop = cache.get_tips_verdict(key)
         if drop is None:
             try:
-                drop = await reconcile_tips(ctx, out)
+                drop = await reconcile_tips(ctx, out, meta={"kind": "reconcile_tips", "user_id": current_user["user_id"]})
             except Exception as e:
                 logger.warning(f"tips reconcile failed (serving unfiltered): {e}")
                 drop = []
@@ -796,7 +819,8 @@ async def get_report(report_id: str, current_user: dict = Depends(get_current_us
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
     doc = await db.fetchrow(
-        "select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
+        "select * from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
+        report_id, current_user["user_id"]
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -816,15 +840,17 @@ async def get_report(report_id: str, current_user: dict = Depends(get_current_us
 async def delete_report(report_id: str, current_user: dict = Depends(get_current_user)):
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
-    path = await db.fetchval(
-        "delete from reports where id = $1::uuid and user_id = $2 returning coalesce(storage_path, '')",
-        report_id, current_user["user_id"],
+    # Soft delete: the row (and its stored file) survives with deleted_at set, so an
+    # accidental delete is recoverable by support. Account deletion still hard-deletes
+    # everything via FK cascade + storage cleanup, keeping the privacy-policy promise.
+    marked = await db.fetchval(
+        """update reports set deleted_at = $3 where id = $1::uuid and user_id = $2
+           and deleted_at is null returning 1""",
+        report_id, current_user["user_id"], datetime.now(timezone.utc).isoformat(),
     )
-    if path is None:
+    if not marked:
         raise HTTPException(status_code=404, detail="Report not found")
     cache.invalidate_reports(current_user["user_id"])
-    if path:
-        await storage.delete_files(path.split(","))
     return {"deleted": True}
 
 
@@ -882,6 +908,7 @@ async def edit_biomarker(
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
     b = dict(biomarkers[req.index])
     old_value, old_status = b.get("value"), b.get("status")
+    old_tip, old_explanation = b.get("tip"), b.get("explanation")
     # First edit pins the AI-read original on the marker itself (report_edits keeps
     # the full history); later edits never overwrite it.
     if b.get("original_value") is None:
@@ -912,6 +939,7 @@ async def edit_biomarker(
             fresh_advice = await refresh_marker_advice(
                 build_profile_context(display_name or current_user.get("name", ""), hp),
                 b, [suggestions[i] for i in linked_idx], language=language,
+                meta={"kind": "refresh_advice", "user_id": current_user["user_id"], "report_id": report_id},
             )
             if fresh_advice.get("explanation"):
                 b["explanation"] = str(fresh_advice["explanation"]).strip()
@@ -940,12 +968,14 @@ async def edit_biomarker(
     )
     # Audit trail: the pre-edit value survives so an admin can always see what the
     # AI showed vs what the user changed it to.
+    # Audit captures the ADVICE alongside the numbers: when the tip/explanation
+    # were regenerated for the new value, the pre-edit text survives here.
     await db.execute(
         """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
            values ($1, $2::uuid, $3, $4, $5, $6)""",
         current_user["user_id"], report_id, f"biomarker:{b.get('name', '')}",
-        {"value": old_value, "status": old_status},
-        {"value": b["value"], "status": b["status"]},
+        {"value": old_value, "status": old_status, "tip": old_tip, "explanation": old_explanation},
+        {"value": b["value"], "status": b["status"], "tip": b.get("tip"), "explanation": b.get("explanation")},
         datetime.now(timezone.utc).isoformat(),
     )
     cache.invalidate_reports(current_user["user_id"])

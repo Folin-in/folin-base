@@ -66,6 +66,8 @@ create index if not exists reports_user_uploaded on reports (user_id, uploaded_a
 alter table reports add column if not exists member_id text not null default 'self';
 alter table reports add column if not exists name_mismatch boolean not null default false;
 alter table reports add column if not exists file_hash text;
+alter table reports add column if not exists deleted_at text;
+alter table reports add column if not exists analysis_meta jsonb;
 alter table users add column if not exists google_id text;
 alter table users add column if not exists apple_id text;
 alter table users add column if not exists consented_at text;
@@ -178,6 +180,38 @@ create table if not exists report_feedback (
 );
 create index if not exists report_feedback_report on report_feedback (report_id);
 
+-- Agent trajectories: one row per Gemini call (analyze, verify, refresh, reconcile)
+-- with the exact request context, model that answered (after failover), raw response
+-- text and latency. The raw response is the debugging ground truth when an
+-- extraction looks wrong.
+create table if not exists ai_trajectories (
+  id bigint generated always as identity primary key,
+  user_id text,
+  kind text not null,            -- analyze | verify | refresh_advice | reconcile_tips
+  model text,                    -- model that produced the response (null on total failure)
+  report_id text,                -- linked after the report row exists
+  request jsonb not null default '{}',
+  response_raw text,
+  status text not null,          -- ok | error
+  error text,
+  latency_ms int,
+  created_at text not null
+);
+create index if not exists ai_traj_user on ai_trajectories (user_id, created_at desc);
+create index if not exists ai_traj_report on ai_trajectories (report_id);
+
+-- Profile change history: advice correctness depends on profile state (diet,
+-- allergies, language...), so every change is auditable. Append-only.
+create table if not exists profile_edits (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  field text not null,
+  old_value jsonb,
+  new_value jsonb,
+  changed_at text not null
+);
+create index if not exists profile_edits_user on profile_edits (user_id, changed_at desc);
+
 -- Audit trail for user edits to a report (biomarker corrections, renames).
 -- Append-only: the AI's original value survives every edit, so an admin can always
 -- reconstruct what was shown vs what the user changed it to, and when.
@@ -241,6 +275,12 @@ begin
       foreign key (user_id) references users (user_id) on delete cascade;
     alter table report_edits add constraint report_edits_report_fk
       foreign key (report_id) references reports (id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'ai_traj_user_fk') then
+    alter table ai_trajectories add constraint ai_traj_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
+    alter table profile_edits add constraint profile_edits_user_fk
+      foreign key (user_id) references users (user_id) on delete cascade;
   end if;
   if not exists (select 1 from pg_constraint where conname = 'engagement_events_user_fk') then
     alter table engagement_events add constraint engagement_events_user_fk

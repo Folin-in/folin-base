@@ -8,9 +8,11 @@ import config
 import database as db
 import storage
 from gamification import EVENT_XP, compute_profile, sort_by_effective_date
-from models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, HealthProfileUpdate,
+from models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, ChangeEmailRequest,
+                    ChangePasswordRequest, HealthProfileUpdate,
                     PlanChangeRequest, PreferencesUpdate, default_preferences, public_user)
-from security import get_current_user, revoke_all_refresh_tokens
+from security import (create_access_token, get_current_user, hash_password, issue_refresh_token,
+                      revoke_all_refresh_tokens, verify_password)
 
 router = APIRouter(tags=["users"])
 
@@ -67,11 +69,22 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
             "allergies_asked": req.allergies_asked if "allergies_asked" in payload_set else existing_hp.get("allergies_asked", False),
         }
         updates["health_profile"] = hp
+        # Profile change history: advice correctness depends on profile state, so
+        # every changed field gets an append-only audit row.
+        _now_iso = datetime.now(timezone.utc).isoformat()
+        for k in hp_keys:
+            if existing_hp.get(k) != hp.get(k):
+                await db.execute(
+                    """insert into profile_edits (user_id, field, old_value, new_value, changed_at)
+                       values ($1, $2, $3, $4, $5)""",
+                    current_user["user_id"], k, {"v": existing_hp.get(k)}, {"v": hp.get(k)}, _now_iso,
+                )
 
     if req.name is not None and req.name.strip():
         updates["name"] = req.name.strip()
 
-    # Email update - must be unique, cannot conflict with another account
+    # Email moved to POST /user/change-email (password-confirmed). Kept here only so
+    # older clients that still send it don't break; ignored unless it actually differs.
     email_changed = False
     if req.email is not None:
         new_email = str(req.email).lower().strip()
@@ -207,6 +220,65 @@ async def update_preferences(req: PreferencesUpdate, current_user: dict = Depend
     return {**default_preferences(), **prefs}
 
 
+# ---------- Account security (change password / email) ----------
+async def _rotate_session(user_id: str) -> dict:
+    """Bump token_version (kills every existing token everywhere), then mint a fresh
+    pair for THIS device so the user who just made the change stays signed in."""
+    new_tv = await db.fetchval(
+        "update users set token_version = token_version + 1 where user_id = $1 returning token_version",
+        user_id,
+    )
+    await revoke_all_refresh_tokens(user_id)
+    cache.invalidate(user_id)
+    return {
+        "access_token": create_access_token(user_id, new_tv),
+        "refresh_token": await issue_refresh_token(user_id),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/user/change-password")
+async def change_password(req: ChangePasswordRequest, current_user: dict = Depends(get_current_user)):
+    """Change the password while signed in. Requires the current password, signs every
+    OTHER device out, and returns fresh tokens so this device stays signed in."""
+    if not current_user.get("password_hash"):
+        raise HTTPException(
+            status_code=400,
+            detail="This account signs in with Google or Apple, so it has no password to change.",
+        )
+    if not verify_password(req.current_password, current_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="That current password isn't right.")
+    if req.new_password == req.current_password:
+        raise HTTPException(status_code=400, detail="Your new password must be different from the current one.")
+    await db.execute("update users set password_hash = $1 where user_id = $2",
+                     hash_password(req.new_password), current_user["user_id"])
+    tokens = await _rotate_session(current_user["user_id"])
+    return {"ok": True, **tokens}
+
+
+@router.post("/user/change-email")
+async def change_email(req: ChangeEmailRequest, current_user: dict = Depends(get_current_user)):
+    """Change the sign-in email. Password-confirmed (it is an account takeover vector),
+    signs every other device out, and keeps THIS device signed in with fresh tokens."""
+    if not current_user.get("password_hash"):
+        raise HTTPException(
+            status_code=400,
+            detail="This account signs in with Google or Apple - change the email with that provider instead.",
+        )
+    if not verify_password(req.password, current_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="That password isn't right.")
+    new_email = str(req.new_email).lower().strip()
+    if new_email == (current_user.get("email") or "").lower():
+        raise HTTPException(status_code=400, detail="That's already your email address.")
+    if await db.fetchval("select 1 from users where email = $1 and user_id <> $2",
+                         new_email, current_user["user_id"]):
+        raise HTTPException(status_code=409, detail="That email is already used by another account.")
+    await db.execute("update users set email = $1 where user_id = $2", new_email, current_user["user_id"])
+    tokens = await _rotate_session(current_user["user_id"])
+    user = await db.fetchrow("select * from users where user_id = $1", current_user["user_id"])
+    return {"ok": True, "user": public_user(user), **tokens}
+
+
 # ---------- Plan (free / pro) ----------
 @router.post("/user/plan")
 async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_current_user)):
@@ -263,7 +335,7 @@ async def export_user_data(current_user: dict = Depends(get_current_user)):
     if plan != "pro":
         raise HTTPException(status_code=403, detail="Exporting your data is a Pro feature. Upgrade to unlock.")
     user_id = current_user["user_id"]
-    reports = await db.fetch("select * from reports where user_id = $1 order by uploaded_at desc limit 1000", user_id)
+    reports = await db.fetch("select * from reports where user_id = $1 and deleted_at is null order by uploaded_at desc limit 1000", user_id)
     for r in reports:
         r["id"] = str(r["id"])
     return {

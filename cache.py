@@ -47,7 +47,7 @@ async def get_reports(user_id: str) -> list[dict]:
     if entry and monotonic() - entry[0] <= _REPORTS_TTL:
         return entry[1]
     import database as db
-    rows = await db.fetch("select * from reports where user_id = $1 limit 1000", user_id)
+    rows = await db.fetch("select * from reports where user_id = $1 and deleted_at is null limit 1000", user_id)
     _reports[user_id] = (monotonic(), rows)
     if len(_reports) > 2_000:
         for k in list(_reports)[:200]:
