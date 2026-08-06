@@ -17,7 +17,7 @@ import cache
 import config
 import database as db
 import storage
-from ai_agent import run_ai_analysis, verify_biomarkers
+from ai_agent import refresh_marker_advice, run_ai_analysis, verify_biomarkers
 from ai_tools import build_profile_context
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
@@ -845,6 +845,37 @@ async def edit_biomarker(
     # The user just looked at this value - clear any verification flag.
     b["needs_verification"] = False
     b["verification_note"] = None
+
+    # Advice must follow the value: rewrite this marker's explanation/tip and any
+    # report suggestions linked to it so they fit the corrected number. Best-effort -
+    # if the AI call fails the edit still saves, advice just stays as-is.
+    suggestions = list(doc.get("suggestions") or [])
+    value_changed = (req.value is not None and str(req.value).strip() != str(old_value or "").strip()) or \
+                    (req.status is not None and req.status != old_status)
+    if value_changed:
+        try:
+            marker_name = str(b.get("name") or "").strip().lower()
+            linked_idx = [i for i, sg in enumerate(suggestions)
+                          if str(sg.get("linked_marker") or "").strip().lower() == marker_name]
+            display_name, hp = await resolve_member_profile(current_user, doc.get("member_id") or "self")
+            language = (hp.get("language") or "english").lower()
+            fresh_advice = await refresh_marker_advice(
+                build_profile_context(display_name or current_user.get("name", ""), hp),
+                b, [suggestions[i] for i in linked_idx], language=language,
+            )
+            if fresh_advice.get("explanation"):
+                b["explanation"] = str(fresh_advice["explanation"]).strip()
+            if fresh_advice.get("tip"):
+                b["tip"] = str(fresh_advice["tip"]).strip()
+            rewritten = fresh_advice.get("suggestions") or []
+            for slot, new_sg in zip(linked_idx, rewritten):
+                if isinstance(new_sg, dict) and new_sg.get("body"):
+                    suggestions[slot] = {**suggestions[slot],
+                                         "title": str(new_sg.get("title") or suggestions[slot].get("title")).strip(),
+                                         "body": str(new_sg["body"]).strip()}
+        except Exception as e:
+            logger.warning(f"advice refresh after biomarker edit failed (keeping old advice): {e}")
+
     biomarkers[req.index] = b
 
     normal_count = sum(1 for x in biomarkers if x.get("status") == "normal")
@@ -854,8 +885,8 @@ async def edit_biomarker(
 
     await db.execute(
         """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
-           total_count = $4, health_score = $5 where id = $6::uuid""",
-        biomarkers, normal_count, attention_count, len(biomarkers), health_score, report_id,
+           total_count = $4, health_score = $5, suggestions = $6 where id = $7::uuid""",
+        biomarkers, normal_count, attention_count, len(biomarkers), health_score, suggestions, report_id,
     )
     # Audit trail: the pre-edit value survives so an admin can always see what the
     # AI showed vs what the user changed it to.
