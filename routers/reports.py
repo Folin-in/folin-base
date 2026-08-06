@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re as _re
+from re import escape as _re_escape, search as _re_search
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,7 @@ import cache
 import config
 import database as db
 import storage
-from ai_agent import run_ai_analysis, verify_biomarkers
+from ai_agent import reconcile_tips, refresh_marker_advice, run_ai_analysis, verify_biomarkers
 from ai_tools import build_profile_context
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
@@ -569,6 +570,16 @@ async def list_all_suggestions(
     current_user: dict = Depends(get_current_user),
 ):
     docs = sort_by_effective_date(await _member_reports(current_user["user_id"], member_id), reverse=True)
+    # Tips must reflect the LATEST measurements: once the newest lab report has
+    # re-measured a marker, its advice supersedes anything an older report said
+    # about that marker - so older suggestions linked to it are dropped, not shown
+    # alongside fresh (possibly contradictory) advice.
+    latest_lab = next((d for d in docs if (d.get("report_type") or "lab") == "lab"), None)
+    latest_markers = {
+        (b.get("name") or "").strip().lower()
+        for b in (latest_lab.get("biomarkers") or [])
+    } if latest_lab else set()
+    latest_lab_id = str(latest_lab["id"]) if latest_lab else None
     seen: set[tuple] = set()
     out: list[dict] = []
     reports_meta: list[dict] = []
@@ -582,10 +593,14 @@ async def list_all_suggestions(
             "report_date": r.report_date,
             "uploaded_at": r.uploaded_at,
         })
+        is_latest_lab = r.id == latest_lab_id
         for s in r.suggestions or []:
             key = (s.category or "lifestyle", (s.title or "").strip().lower())
             if not key[1] or key in seen:
                 continue
+            linked = (s.linked_marker or "").strip().lower()
+            if not is_latest_lab and linked and linked in latest_markers:
+                continue  # superseded by the latest report's advice for this marker
             seen.add(key)
             out.append({
                 "title": s.title,
@@ -597,6 +612,41 @@ async def list_all_suggestions(
                 "report_type": r.report_type,
                 "report_date": r.report_date or (r.uploaded_at[:10] if r.uploaded_at else None),
             })
+
+    # The profile may have changed SINCE these tips were generated (diet switched,
+    # allergies added) - stored advice can now contradict it.
+    display_name, hp = await resolve_member_profile(current_user, _member_id_of(member_id))
+
+    # 1) Allergy guard - deterministic safety boundary, never AI-dependent. A tip
+    #    naming a declared allergen is dropped outright (word-boundary match).
+    allergens = [str(a).strip().lower() for a in (hp.get("allergies") or []) if len(str(a).strip()) > 2]
+    if allergens and out:
+        def _mentions_allergen(t: dict) -> bool:
+            text = f"{t['title']} {t['body']}".lower()
+            return any(_re_search(r"\b" + _re_escape(a) + r"\b", text) for a in allergens)
+        out = [t for t in out if not _mentions_allergen(t)]
+
+    # 2) AI conflict pass - cross-report contradictions AND profile conflicts
+    #    (e.g. meat advice after switching to vegetarian). Cached by a hash of the
+    #    tips + profile, so any change in either produces a fresh verdict; fails
+    #    open to the unfiltered list.
+    if len(out) >= 2:
+        ctx = build_profile_context(display_name or current_user.get("name", ""), hp)
+        key = hashlib.sha256(
+            (ctx + json.dumps([[t["title"], t["body"], t["report_date"]] for t in out])).encode()
+        ).hexdigest()
+        drop = cache.get_tips_verdict(key)
+        if drop is None:
+            try:
+                drop = await reconcile_tips(ctx, out)
+            except Exception as e:
+                logger.warning(f"tips reconcile failed (serving unfiltered): {e}")
+                drop = []
+            cache.set_tips_verdict(key, drop)
+        if drop:
+            dropset = set(drop)
+            out = [t for i, t in enumerate(out) if i not in dropset]
+
     return {"reports": reports_meta, "suggestions": out}
 
 
@@ -845,6 +895,37 @@ async def edit_biomarker(
     # The user just looked at this value - clear any verification flag.
     b["needs_verification"] = False
     b["verification_note"] = None
+
+    # Advice must follow the value: rewrite this marker's explanation/tip and any
+    # report suggestions linked to it so they fit the corrected number. Best-effort -
+    # if the AI call fails the edit still saves, advice just stays as-is.
+    suggestions = list(doc.get("suggestions") or [])
+    value_changed = (req.value is not None and str(req.value).strip() != str(old_value or "").strip()) or \
+                    (req.status is not None and req.status != old_status)
+    if value_changed:
+        try:
+            marker_name = str(b.get("name") or "").strip().lower()
+            linked_idx = [i for i, sg in enumerate(suggestions)
+                          if str(sg.get("linked_marker") or "").strip().lower() == marker_name]
+            display_name, hp = await resolve_member_profile(current_user, doc.get("member_id") or "self")
+            language = (hp.get("language") or "english").lower()
+            fresh_advice = await refresh_marker_advice(
+                build_profile_context(display_name or current_user.get("name", ""), hp),
+                b, [suggestions[i] for i in linked_idx], language=language,
+            )
+            if fresh_advice.get("explanation"):
+                b["explanation"] = str(fresh_advice["explanation"]).strip()
+            if fresh_advice.get("tip"):
+                b["tip"] = str(fresh_advice["tip"]).strip()
+            rewritten = fresh_advice.get("suggestions") or []
+            for slot, new_sg in zip(linked_idx, rewritten):
+                if isinstance(new_sg, dict) and new_sg.get("body"):
+                    suggestions[slot] = {**suggestions[slot],
+                                         "title": str(new_sg.get("title") or suggestions[slot].get("title")).strip(),
+                                         "body": str(new_sg["body"]).strip()}
+        except Exception as e:
+            logger.warning(f"advice refresh after biomarker edit failed (keeping old advice): {e}")
+
     biomarkers[req.index] = b
 
     normal_count = sum(1 for x in biomarkers if x.get("status") == "normal")
@@ -854,8 +935,8 @@ async def edit_biomarker(
 
     await db.execute(
         """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
-           total_count = $4, health_score = $5 where id = $6::uuid""",
-        biomarkers, normal_count, attention_count, len(biomarkers), health_score, report_id,
+           total_count = $4, health_score = $5, suggestions = $6 where id = $7::uuid""",
+        biomarkers, normal_count, attention_count, len(biomarkers), health_score, suggestions, report_id,
     )
     # Audit trail: the pre-edit value survives so an admin can always see what the
     # AI showed vs what the user changed it to.

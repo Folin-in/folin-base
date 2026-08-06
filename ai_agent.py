@@ -15,7 +15,7 @@ import time
 import httpx
 
 import config
-from ai_prompts import VERIFY_SYSTEM_PROMPT, build_system_prompt
+from ai_prompts import RECONCILE_TIPS_PROMPT, REFRESH_ADVICE_PROMPT, VERIFY_SYSTEM_PROMPT, build_system_prompt
 from ai_tools import extract_json
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def _model_order(models: list[str], failed_at: dict[str, float], now: float,
 
 
 async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str, user_text: str) -> dict:
-    """Send a document (1 file of any supported type, or 2-5 image pages) + prompt to Gemini
+    """Send a document (0-5 files; text-only when files is empty) + prompt to Gemini
     as ONE multimodal message and return the parsed JSON. Fails over across GEMINI_MODELS."""
     parts = []
     for file_path, mime_type in files:
@@ -110,3 +110,35 @@ if __name__ == "__main__":
     # Everything cooling down: all models still tried, in priority order.
     assert _model_order(["a", "b"], {"a": 999.0, "b": 999.0}, now=1000.0) == ["a", "b"]
     print("ai_agent self-check passed")
+
+
+async def refresh_marker_advice(profile_context: str, marker: dict,
+                                linked_suggestions: list[dict], language: str = "english") -> dict:
+    """After a user corrects a biomarker value, rewrite that marker's explanation/tip
+    and any report suggestions linked to it so the advice matches the NEW value.
+    Text-only Gemini call (no document needed). Raises on failure - caller decides
+    whether stale advice is acceptable."""
+    # Always explicit - without this the model drifts into Hinglish when the
+    # profile context mentions Indian foods.
+    lang_note = f" Write ALL narrative text strictly in this language: {language}."
+    payload = {
+        "marker": {"name": marker.get("name"), "value": marker.get("value"), "unit": marker.get("unit"),
+                   "ref_range": marker.get("ref_range"), "status": marker.get("status")},
+        "linked_suggestions": [{"title": s.get("title"), "body": s.get("body")} for s in linked_suggestions],
+    }
+    text = f"{profile_context}{lang_note}\nCorrected marker and its current suggestions:\n" + json.dumps(payload, ensure_ascii=False)
+    return await _gemini_document_call([], REFRESH_ADVICE_PROMPT, text)
+
+
+async def reconcile_tips(profile_context: str, tips: list[dict]) -> list[int]:
+    """Cross-report conflict check on the aggregated tips feed. Returns indices to
+    drop (older side of each genuine contradiction). Raises on failure - caller
+    fails open and serves the unfiltered list."""
+    numbered = [
+        {"i": i, "title": t.get("title"), "body": t.get("body"),
+         "linked_marker": t.get("linked_marker"), "from": t.get("report_date")}
+        for i, t in enumerate(tips)
+    ]
+    text = f"{profile_context}\nTips:\n" + json.dumps(numbered, ensure_ascii=False)
+    parsed = await _gemini_document_call([], RECONCILE_TIPS_PROMPT, text)
+    return [i for i in (parsed.get("drop") or []) if isinstance(i, int) and 0 <= i < len(tips)]
