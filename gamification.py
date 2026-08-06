@@ -229,6 +229,14 @@ def _engagement_xp(events: List[dict]) -> tuple:
             xp += EVENT_XP[etype]
             continue
 
+        # Record what was read BEFORE the XP cap check - the cap limits farming XP,
+        # it must not stop the Well Read badge from seeing markers 6+ of a report.
+        if etype == "explanation_read":
+            rid = str(e.get("report_id") or "")
+            marker = (e.get("ref") or "").strip().lower()
+            if rid and marker:
+                per_report_reads.setdefault(rid, set()).add(marker)
+
         day = (e.get("at") or "")[:10]
         cap = EVENT_DAILY_CAP.get(etype)
         if cap is not None:
@@ -237,12 +245,6 @@ def _engagement_xp(events: List[dict]) -> tuple:
                 continue
             daily_counts[key] = daily_counts.get(key, 0) + 1
         xp += EVENT_XP[etype]
-
-        if etype == "explanation_read":
-            rid = str(e.get("report_id") or "")
-            marker = (e.get("ref") or "").strip().lower()
-            if rid and marker:
-                per_report_reads.setdefault(rid, set()).add(marker)
 
     return xp, seen_types, per_report_reads
 
@@ -357,7 +359,10 @@ def compute_profile(
 
     level = xp // XP_PER_LEVEL + 1
     xp_in_level = xp % XP_PER_LEVEL
-    scores = [r.get("health_score", 0) for r in reports]
+    # Only lab reports carry a measured score. A prescription/visit note scores by
+    # document heuristic (~65) and used to overwrite "your health score".
+    scored = [r for r in reports if (r.get("report_type") or "lab") == "lab"]
+    scores = [r.get("health_score", 0) for r in scored]
 
     defs = list(BADGE_DEFS)
     if include_retired:

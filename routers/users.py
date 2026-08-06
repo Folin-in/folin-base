@@ -169,7 +169,10 @@ async def get_gamification_profile(
     mid = (member_id or "self").strip() or "self"
     rows = await cache.get_reports(current_user["user_id"])
     docs = [r for r in rows if r.get("member_id", "self") == mid]
-    return compute_profile(sort_by_effective_date(docs), events=await fetch_events(current_user["user_id"]))
+    # Engagement events belong to the ACCOUNT, not to a sub-profile - a family
+    # member with no reports was showing the owner's XP and level.
+    events = await fetch_events(current_user["user_id"]) if mid == "self" else []
+    return compute_profile(sort_by_effective_date(docs), events=events)
 
 
 # ---------- Consent (social-login users consent post-login; email signups at register) ----------

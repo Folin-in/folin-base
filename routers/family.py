@@ -25,8 +25,14 @@ async def _member_summary(user_id: str) -> dict:
     user = await db.fetchrow("select * from users where user_id = $1", user_id)
     if not user:
         return {}
-    rows = await cache.get_reports(user_id)
-    docs = sorted(rows, key=lambda r: r.get("uploaded_at") or "", reverse=True)[:20]
+    # ONLY the account holder's own reports. Including sub-profiles made a user's
+    # shared score jump to whatever they last uploaded for a family member.
+    rows = [r for r in await cache.get_reports(user_id) if r.get("member_id", "self") == "self"]
+    # Score + trend come from LAB reports only, matching the profile tab. A
+    # prescription photo scores ~65 by heuristic and used to become the score
+    # your family sees (66 here vs 81 on your own profile).
+    docs = sorted([r for r in rows if (r.get("report_type") or "lab") == "lab"],
+                  key=lambda r: r.get("uploaded_at") or "", reverse=True)[:20]
     # Same inputs as the profile tab - omitting events made XP/badges diverge
     # between the family view and the member's own profile screen.
     profile = compute_profile(rows, events=await fetch_events(user_id))

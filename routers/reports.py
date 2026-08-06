@@ -27,7 +27,7 @@ from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, Biom
 from rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from routers.members import resolve_member_profile
 from routers.users import fetch_events
-from sanity import sanity_note
+from sanity import _parse_range as _parse_ref_bounds, sanity_note
 from security import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -559,6 +559,18 @@ async def analyze_status(job_id: str, current_user: dict = Depends(get_current_u
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Job not found")
+    # A process restart mid-job leaves the row 'processing' with nothing to finish
+    # it, so the client polled forever. Report it as failed once it is older than
+    # the server timeout + grace (same window _active_job uses to unblock uploads).
+    if doc.get("status") in ("pending", "processing"):
+        try:
+            started = datetime.fromisoformat(doc["created_at"])
+            if datetime.now(timezone.utc) - started > timedelta(seconds=ANALYZE_JOB_TIMEOUT_SECS + 60):
+                doc = dict(doc)
+                doc["status"] = "error"
+                doc["error"] = "That analysis was interrupted. Please try uploading again."
+        except ValueError:
+            pass
     return doc
 
 
@@ -653,6 +665,9 @@ async def list_all_suggestions(
     #    (e.g. meat advice after switching to vegetarian). Cached by a hash of the
     #    tips + profile, so any change in either produces a fresh verdict; fails
     #    open to the unfiltered list.
+    # NEVER block the screen on the AI: a cold cache used to cost ~37s of spinner.
+    # Apply a cached verdict instantly; otherwise serve unfiltered now and compute
+    # the verdict in the background so the next view has it.
     if len(out) >= 2:
         ctx = build_profile_context(display_name or current_user.get("name", ""), hp)
         key = hashlib.sha256(
@@ -660,13 +675,20 @@ async def list_all_suggestions(
         ).hexdigest()
         drop = cache.get_tips_verdict(key)
         if drop is None:
-            try:
-                drop = await reconcile_tips(ctx, out, meta={"kind": "reconcile_tips", "user_id": current_user["user_id"]})
-            except Exception as e:
-                logger.warning(f"tips reconcile failed (serving unfiltered): {e}")
-                drop = []
-            cache.set_tips_verdict(key, drop)
-        if drop:
+            snapshot = list(out)
+            uid = current_user["user_id"]
+
+            async def _warm_verdict():
+                try:
+                    verdict = await reconcile_tips(ctx, snapshot,
+                                                   meta={"kind": "reconcile_tips", "user_id": uid})
+                except Exception as e:
+                    logger.warning(f"tips reconcile failed (leaving unfiltered): {e}")
+                    verdict = []
+                cache.set_tips_verdict(key, verdict)
+
+            asyncio.create_task(_warm_verdict())
+        elif drop:
             dropset = set(drop)
             out = [t for i, t in enumerate(out) if i not in dropset]
 
@@ -724,6 +746,9 @@ def _default_report_title(report_type: str | None) -> str:
 
 
 SEVERITY = {"normal": 0, "borderline_high": 1, "borderline_low": 1, "high": 2, "low": 2}
+# Reports whose score reflects measured biology. A prescription photo scores 65 by
+# heuristic; letting it set "your health score" made the number drop for no reason.
+SCORING_TYPES = {"lab"}
 
 
 def _to_float(v):
@@ -731,6 +756,23 @@ def _to_float(v):
         return float(str(v).replace(",", "").strip())
     except Exception:
         return None
+
+
+def _range_distance(value, ref_range: str):
+    """How far a value sits OUTSIDE its printed reference range (0 when in range).
+    Lets compare tell 'drifted further out' from 'came back toward range' when the
+    status band itself didn't change."""
+    v = _to_float(value)
+    if v is None:
+        return None
+    lo, hi = _parse_ref_bounds(ref_range)
+    if lo is None and hi is None:
+        return None
+    if lo is not None and v < lo:
+        return lo - v
+    if hi is not None and v > hi:
+        return v - hi
+    return 0.0
 
 
 def _report_ref(doc: dict) -> dict:
@@ -783,7 +825,19 @@ async def compare_reports(
             continue
         cur_sev = SEVERITY.get(b.get("status"), 1)
         old_sev = SEVERITY.get(ob.get("status"), 1)
-        change = "improved" if cur_sev < old_sev else "worsened" if cur_sev > old_sev else "same"
+        if cur_sev != old_sev:
+            change = "improved" if cur_sev < old_sev else "worsened"
+        else:
+            # Same status band. A flagged marker that drifted further outside its
+            # range had been reported as "same" (e.g. HbA1c 5.5 -> 5.9, both
+            # borderline high) - compare distance from the range instead.
+            ref = b.get("ref_range") or ob.get("ref_range") or ""
+            cur_d = _range_distance(b.get("value"), ref)
+            old_d = _range_distance(ob.get("value"), ref)
+            if cur_sev == 0 or cur_d is None or old_d is None or cur_d == old_d:
+                change = "same"   # in range, or unparseable, or genuinely unchanged
+            else:
+                change = "improved" if cur_d < old_d else "worsened"
         counts[change] += 1
         cv, ov = _to_float(b.get("value")), _to_float(ob.get("value"))
         markers.append({
@@ -897,7 +951,8 @@ async def edit_biomarker(
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
     doc = await db.fetchrow(
-        "select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"]
+        "select * from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
+        report_id, current_user["user_id"]
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -998,7 +1053,7 @@ async def submit_report_feedback(
     if not _valid_id(report_id):
         raise HTTPException(status_code=400, detail="Invalid report id")
     doc = await db.fetchrow(
-        "select biomarkers from reports where id = $1::uuid and user_id = $2",
+        "select biomarkers from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
         report_id, current_user["user_id"],
     )
     if not doc:
