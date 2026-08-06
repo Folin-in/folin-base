@@ -569,6 +569,16 @@ async def list_all_suggestions(
     current_user: dict = Depends(get_current_user),
 ):
     docs = sort_by_effective_date(await _member_reports(current_user["user_id"], member_id), reverse=True)
+    # Tips must reflect the LATEST measurements: once the newest lab report has
+    # re-measured a marker, its advice supersedes anything an older report said
+    # about that marker - so older suggestions linked to it are dropped, not shown
+    # alongside fresh (possibly contradictory) advice.
+    latest_lab = next((d for d in docs if (d.get("report_type") or "lab") == "lab"), None)
+    latest_markers = {
+        (b.get("name") or "").strip().lower()
+        for b in (latest_lab.get("biomarkers") or [])
+    } if latest_lab else set()
+    latest_lab_id = str(latest_lab["id"]) if latest_lab else None
     seen: set[tuple] = set()
     out: list[dict] = []
     reports_meta: list[dict] = []
@@ -582,10 +592,14 @@ async def list_all_suggestions(
             "report_date": r.report_date,
             "uploaded_at": r.uploaded_at,
         })
+        is_latest_lab = r.id == latest_lab_id
         for s in r.suggestions or []:
             key = (s.category or "lifestyle", (s.title or "").strip().lower())
             if not key[1] or key in seen:
                 continue
+            linked = (s.linked_marker or "").strip().lower()
+            if not is_latest_lab and linked and linked in latest_markers:
+                continue  # superseded by the latest report's advice for this marker
             seen.add(key)
             out.append({
                 "title": s.title,
