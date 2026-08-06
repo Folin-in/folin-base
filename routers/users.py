@@ -67,6 +67,16 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
             "allergies_asked": req.allergies_asked if "allergies_asked" in payload_set else existing_hp.get("allergies_asked", False),
         }
         updates["health_profile"] = hp
+        # Profile change history: advice correctness depends on profile state, so
+        # every changed field gets an append-only audit row.
+        _now_iso = datetime.now(timezone.utc).isoformat()
+        for k in hp_keys:
+            if existing_hp.get(k) != hp.get(k):
+                await db.execute(
+                    """insert into profile_edits (user_id, field, old_value, new_value, changed_at)
+                       values ($1, $2, $3, $4, $5)""",
+                    current_user["user_id"], k, {"v": existing_hp.get(k)}, {"v": hp.get(k)}, _now_iso,
+                )
 
     if req.name is not None and req.name.strip():
         updates["name"] = req.name.strip()
@@ -263,7 +273,7 @@ async def export_user_data(current_user: dict = Depends(get_current_user)):
     if plan != "pro":
         raise HTTPException(status_code=403, detail="Exporting your data is a Pro feature. Upgrade to unlock.")
     user_id = current_user["user_id"]
-    reports = await db.fetch("select * from reports where user_id = $1 order by uploaded_at desc limit 1000", user_id)
+    reports = await db.fetch("select * from reports where user_id = $1 and deleted_at is null order by uploaded_at desc limit 1000", user_id)
     for r in reports:
         r["id"] = str(r["id"])
     return {

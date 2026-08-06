@@ -11,10 +11,12 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 import httpx
 
 import config
+import database as db
 from ai_prompts import RECONCILE_TIPS_PROMPT, REFRESH_ADVICE_PROMPT, VERIFY_SYSTEM_PROMPT, build_system_prompt
 from ai_tools import extract_json
 
@@ -34,14 +36,40 @@ def _model_order(models: list[str], failed_at: dict[str, float], now: float,
     return healthy + cooling
 
 
-async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str, user_text: str) -> dict:
+async def _log_trajectory(meta: dict | None, request: dict, model: str | None,
+                          response_raw: str | None, status: str, error: str | None,
+                          latency_ms: int) -> None:
+    """Append the agent call to ai_trajectories. Best-effort - never breaks the caller
+    (e.g. self-check scripts run without a DB pool)."""
+    meta = meta or {}
+    try:
+        traj_id = await db.fetchval(
+            """insert into ai_trajectories (user_id, kind, model, report_id, request,
+                 response_raw, status, error, latency_ms, created_at)
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning id""",
+            meta.get("user_id"), meta.get("kind", "unknown"), model, meta.get("report_id"),
+            request, response_raw, status, error, latency_ms,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        meta["trajectory_id"] = traj_id
+        meta["model"] = model
+    except Exception as e:
+        logger.warning(f"trajectory log failed (continuing): {e}")
+
+
+async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str,
+                                user_text: str, meta: dict | None = None) -> dict:
     """Send a document (0-5 files; text-only when files is empty) + prompt to Gemini
-    as ONE multimodal message and return the parsed JSON. Fails over across GEMINI_MODELS."""
+    as ONE multimodal message and return the parsed JSON. Fails over across GEMINI_MODELS.
+    Every call is recorded in ai_trajectories with its raw response (pass `meta` with
+    kind/user_id/report_id to attribute it; meta gets trajectory_id + model back)."""
     parts = []
+    files_meta = []
     for file_path, mime_type in files:
         with open(file_path, "rb") as f:
-            file_b64 = base64.b64encode(f.read()).decode()
-        parts.append({"inline_data": {"mime_type": mime_type, "data": file_b64}})
+            raw = f.read()
+        parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(raw).decode()}})
+        files_meta.append({"mime_type": mime_type, "bytes": len(raw)})
     parts.append({"text": user_text})
 
     body = {
@@ -51,6 +79,8 @@ async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str
         # produce the same markers, statuses and score.
         "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
     }
+    request_log = {"user_text": user_text, "files": files_meta, "attempts": []}
+    started = time.monotonic()
 
     last_err: Exception | None = None
     for model in _model_order(config.GEMINI_MODELS, _model_failed_at, time.monotonic()):
@@ -62,6 +92,8 @@ async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str
             text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
             parsed = extract_json(text)
             _model_failed_at.pop(model, None)
+            await _log_trajectory(meta, request_log, model, text, "ok", None,
+                                  int((time.monotonic() - started) * 1000))
             return parsed
         except Exception as e:
             # Covers HTTP errors, timeouts, missing candidates and JSON parse failures -
@@ -69,11 +101,16 @@ async def _gemini_document_call(files: list[tuple[str, str]], system_prompt: str
             # every model and surfaces the last error, same as before.
             _model_failed_at[model] = time.monotonic()
             last_err = e
+            request_log["attempts"].append({"model": model, "error": f"{type(e).__name__}: {e}"[:300]})
             logger.warning(f"model {model} failed ({type(e).__name__}: {e}); trying next model")
+    await _log_trajectory(meta, request_log, None, None, "error",
+                          str(last_err)[:500] if last_err else "GEMINI_MODELS is empty",
+                          int((time.monotonic() - started) * 1000))
     raise last_err if last_err else RuntimeError("GEMINI_MODELS is empty")
 
 
-async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str, language: str = "english") -> dict:
+async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str,
+                          language: str = "english", meta: dict | None = None) -> dict:
     """files: list of (file_path, mime_type). Multiple files are pages of ONE document
     (images only - enforced upstream in the router)."""
     page_note = (
@@ -82,10 +119,11 @@ async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str, la
         if len(files) > 1 else ""
     )
     text = f"Analyze this medical document and return JSON matching the correct report_type.{page_note} {profile_context}"
-    return await _gemini_document_call(files, build_system_prompt(language), text)
+    return await _gemini_document_call(files, build_system_prompt(language), text, meta=meta)
 
 
-async def verify_biomarkers(files: list[tuple[str, str]], biomarkers: list[dict]) -> list[dict]:
+async def verify_biomarkers(files: list[tuple[str, str]], biomarkers: list[dict],
+                            meta: dict | None = None) -> list[dict]:
     """PRO self-check: second AI pass that cross-checks the extraction against the document.
     Returns a list of {name, issue, expected} mismatches (may be empty)."""
     compact = [
@@ -94,7 +132,7 @@ async def verify_biomarkers(files: list[tuple[str, str]], biomarkers: list[dict]
         for b in biomarkers
     ]
     text = "Verify this extraction against the attached document:\n" + json.dumps(compact, ensure_ascii=False)
-    parsed = await _gemini_document_call(files, VERIFY_SYSTEM_PROMPT, text)
+    parsed = await _gemini_document_call(files, VERIFY_SYSTEM_PROMPT, text, meta=meta)
     out = parsed.get("mismatches") or []
     return [m for m in out if isinstance(m, dict) and m.get("name")]
 
@@ -113,7 +151,8 @@ if __name__ == "__main__":
 
 
 async def refresh_marker_advice(profile_context: str, marker: dict,
-                                linked_suggestions: list[dict], language: str = "english") -> dict:
+                                linked_suggestions: list[dict], language: str = "english",
+                                meta: dict | None = None) -> dict:
     """After a user corrects a biomarker value, rewrite that marker's explanation/tip
     and any report suggestions linked to it so the advice matches the NEW value.
     Text-only Gemini call (no document needed). Raises on failure - caller decides
@@ -127,10 +166,10 @@ async def refresh_marker_advice(profile_context: str, marker: dict,
         "linked_suggestions": [{"title": s.get("title"), "body": s.get("body")} for s in linked_suggestions],
     }
     text = f"{profile_context}{lang_note}\nCorrected marker and its current suggestions:\n" + json.dumps(payload, ensure_ascii=False)
-    return await _gemini_document_call([], REFRESH_ADVICE_PROMPT, text)
+    return await _gemini_document_call([], REFRESH_ADVICE_PROMPT, text, meta=meta)
 
 
-async def reconcile_tips(profile_context: str, tips: list[dict]) -> list[int]:
+async def reconcile_tips(profile_context: str, tips: list[dict], meta: dict | None = None) -> list[int]:
     """Cross-report conflict check on the aggregated tips feed. Returns indices to
     drop (older side of each genuine contradiction). Raises on failure - caller
     fails open and serves the unfiltered list."""
@@ -140,5 +179,5 @@ async def reconcile_tips(profile_context: str, tips: list[dict]) -> list[int]:
         for i, t in enumerate(tips)
     ]
     text = f"{profile_context}\nTips:\n" + json.dumps(numbered, ensure_ascii=False)
-    parsed = await _gemini_document_call([], RECONCILE_TIPS_PROMPT, text)
+    parsed = await _gemini_document_call([], RECONCILE_TIPS_PROMPT, text, meta=meta)
     return [i for i in (parsed.get("drop") or []) if isinstance(i, int) and 0 <= i < len(tips)]
