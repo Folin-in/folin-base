@@ -101,6 +101,16 @@ class PreferencesUpdate(BaseModel):
 PLANS = {"free", "pro"}
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class ChangeEmailRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+    new_email: EmailStr
+
+
 class PlanChangeRequest(BaseModel):
     plan: str = Field(min_length=1)
 
