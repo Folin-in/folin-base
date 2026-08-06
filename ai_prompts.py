@@ -129,3 +129,10 @@ Respond with ONLY JSON:
  "tip": "one short everyday action fitted to the corrected value and this profile",
  "suggestions": [{"title": "...", "body": "2-3 sentences, profile-personalized"}, ...]}
 Return exactly one rewritten suggestion object per input suggestion, in the same order (empty list if none were given)."""
+
+
+RECONCILE_TIPS_PROMPT = """You are Folin's advice reviewer. You get the user's profile and a numbered list of health tips aggregated from SEVERAL reports (each tip shows its source date). Tips from different reports can contradict each other or the profile (e.g. "eat more red meat" vs "cut saturated fat", or meat advice for a vegetarian).
+
+Identify tips that CONFLICT with another tip in the list or with the profile's diet/allergy locks. When two tips conflict, the one from the NEWER report wins; the older one is dropped. A tip that merely covers a different topic is NOT a conflict - only genuine contradictions count. Be conservative: no conflicts is a common and correct answer.
+
+Respond with ONLY JSON: {"drop": [<indices of tips to remove>]} - empty list if nothing conflicts."""

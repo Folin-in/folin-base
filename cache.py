@@ -57,3 +57,24 @@ async def get_reports(user_id: str) -> list[dict]:
 
 def invalidate_reports(user_id: str) -> None:
     _reports.pop(user_id, None)
+
+
+# ---- Tips conflict-verdict cache ----
+# Keyed by a hash of the aggregated tips content, so any report change produces a
+# new key and stale verdicts simply stop being read. 24h TTL bounds growth.
+# ponytail: in-process dict like the rest of this module; Redis if we scale out
+_tips_verdicts: dict = {}
+_TIPS_TTL = 24 * 3600
+
+def get_tips_verdict(key: str):
+    import time as _t
+    hit = _tips_verdicts.get(key)
+    if hit and _t.monotonic() - hit[0] < _TIPS_TTL:
+        return hit[1]
+    return None
+
+def set_tips_verdict(key: str, drop: list) -> None:
+    import time as _t
+    if len(_tips_verdicts) > 500:
+        _tips_verdicts.clear()
+    _tips_verdicts[key] = (_t.monotonic(), drop)

@@ -15,7 +15,7 @@ import time
 import httpx
 
 import config
-from ai_prompts import REFRESH_ADVICE_PROMPT, VERIFY_SYSTEM_PROMPT, build_system_prompt
+from ai_prompts import RECONCILE_TIPS_PROMPT, REFRESH_ADVICE_PROMPT, VERIFY_SYSTEM_PROMPT, build_system_prompt
 from ai_tools import extract_json
 
 logger = logging.getLogger(__name__)
@@ -128,3 +128,17 @@ async def refresh_marker_advice(profile_context: str, marker: dict,
     }
     text = f"{profile_context}{lang_note}\nCorrected marker and its current suggestions:\n" + json.dumps(payload, ensure_ascii=False)
     return await _gemini_document_call([], REFRESH_ADVICE_PROMPT, text)
+
+
+async def reconcile_tips(profile_context: str, tips: list[dict]) -> list[int]:
+    """Cross-report conflict check on the aggregated tips feed. Returns indices to
+    drop (older side of each genuine contradiction). Raises on failure - caller
+    fails open and serves the unfiltered list."""
+    numbered = [
+        {"i": i, "title": t.get("title"), "body": t.get("body"),
+         "linked_marker": t.get("linked_marker"), "from": t.get("report_date")}
+        for i, t in enumerate(tips)
+    ]
+    text = f"{profile_context}\nTips:\n" + json.dumps(numbered, ensure_ascii=False)
+    parsed = await _gemini_document_call([], RECONCILE_TIPS_PROMPT, text)
+    return [i for i in (parsed.get("drop") or []) if isinstance(i, int) and 0 <= i < len(tips)]

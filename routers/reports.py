@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re as _re
+from re import escape as _re_escape, search as _re_search
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,7 @@ import cache
 import config
 import database as db
 import storage
-from ai_agent import refresh_marker_advice, run_ai_analysis, verify_biomarkers
+from ai_agent import reconcile_tips, refresh_marker_advice, run_ai_analysis, verify_biomarkers
 from ai_tools import build_profile_context
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
@@ -611,6 +612,41 @@ async def list_all_suggestions(
                 "report_type": r.report_type,
                 "report_date": r.report_date or (r.uploaded_at[:10] if r.uploaded_at else None),
             })
+
+    # The profile may have changed SINCE these tips were generated (diet switched,
+    # allergies added) - stored advice can now contradict it.
+    display_name, hp = await resolve_member_profile(current_user, _member_id_of(member_id))
+
+    # 1) Allergy guard - deterministic safety boundary, never AI-dependent. A tip
+    #    naming a declared allergen is dropped outright (word-boundary match).
+    allergens = [str(a).strip().lower() for a in (hp.get("allergies") or []) if len(str(a).strip()) > 2]
+    if allergens and out:
+        def _mentions_allergen(t: dict) -> bool:
+            text = f"{t['title']} {t['body']}".lower()
+            return any(_re_search(r"\b" + _re_escape(a) + r"\b", text) for a in allergens)
+        out = [t for t in out if not _mentions_allergen(t)]
+
+    # 2) AI conflict pass - cross-report contradictions AND profile conflicts
+    #    (e.g. meat advice after switching to vegetarian). Cached by a hash of the
+    #    tips + profile, so any change in either produces a fresh verdict; fails
+    #    open to the unfiltered list.
+    if len(out) >= 2:
+        ctx = build_profile_context(display_name or current_user.get("name", ""), hp)
+        key = hashlib.sha256(
+            (ctx + json.dumps([[t["title"], t["body"], t["report_date"]] for t in out])).encode()
+        ).hexdigest()
+        drop = cache.get_tips_verdict(key)
+        if drop is None:
+            try:
+                drop = await reconcile_tips(ctx, out)
+            except Exception as e:
+                logger.warning(f"tips reconcile failed (serving unfiltered): {e}")
+                drop = []
+            cache.set_tips_verdict(key, drop)
+        if drop:
+            dropset = set(drop)
+            out = [t for i, t in enumerate(out) if i not in dropset]
+
     return {"reports": reports_meta, "suggestions": out}
 
 
