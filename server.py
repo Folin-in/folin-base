@@ -6,7 +6,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 import config  # noqa: F401 - loads .env first
 import database
-from routers import auth, family, members, reports, users
+from routers import auth, family, members, payments, reports, users
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ api_router.include_router(reports.router)
 api_router.include_router(users.router)
 api_router.include_router(family.router)
 api_router.include_router(members.router)
+api_router.include_router(payments.router)
 
 app.include_router(api_router)
 

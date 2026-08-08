@@ -44,8 +44,13 @@ PRO_TERM_DAYS = int(os.environ["PRO_TERM_DAYS"])
 PRO_PRICE_INR = int(os.environ["PRO_PRICE_INR"])
 
 # SEC-002: self-serve Pro toggle. TRUE only for preview/demo. In production this MUST be
-# false so plan changes come exclusively from a verified payment webhook (Stripe).
+# false so plan changes come exclusively from a verified payment.
 ALLOW_SELF_SERVE_PRO = os.environ["ALLOW_SELF_SERVE_PRO"].strip().lower() == "true"
+
+# Razorpay. KEY_ID is public (the app needs it to open checkout); KEY_SECRET signs and
+# verifies payments and must never leave the backend.
+RAZORPAY_KEY_ID = os.environ["RAZORPAY_KEY_ID"]
+RAZORPAY_KEY_SECRET = os.environ["RAZORPAY_KEY_SECRET"]
 
 # Social login. Google: comma-separated OAuth client IDs allowed as `aud` (iOS + web).
 # Empty → /auth/google returns 503. Apple: verified against the app's bundle id.
