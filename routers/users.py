@@ -85,15 +85,16 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
 
     # Email moved to POST /user/change-email (password-confirmed). Kept here only so
     # older clients that still send it don't break; ignored unless it actually differs.
+    # Email is deliberately NOT changeable here. /user/change-email confirms the current
+    # password first because changing the sign-in address is an account-takeover vector,
+    # and it refuses social accounts outright (Google/Apple owns that address). Allowing a
+    # silent change through the profile endpoint would make both of those guards pointless.
     email_changed = False
-    if req.email is not None:
-        new_email = str(req.email).lower().strip()
-        if new_email != current_user["email"].lower():
-            if await db.fetchval("select 1 from users where email = $1 and user_id <> $2",
-                                 new_email, current_user["user_id"]):
-                raise HTTPException(status_code=409, detail="That email is already used by another account.")
-            updates["email"] = new_email
-            email_changed = True
+    if req.email is not None and str(req.email).lower().strip() != (current_user.get("email") or "").lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Change your email from Settings → Account so we can confirm it's you.",
+        )
 
     # Username update - must be unique
     if req.username is not None:

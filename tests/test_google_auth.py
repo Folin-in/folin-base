@@ -474,5 +474,66 @@ def test_logout_revokes_google_session_then_signin_works_again():
     run(t)
 
 
+# ------------------------------------------- google accounts: email/password are locked
+
+def test_google_user_cannot_change_password_or_email():
+    """A Google account has no password and doesn't own its email - both endpoints must
+    refuse it rather than fail somewhere deeper."""
+    email = f"{uniq()}@example.com"
+
+    async def t(c):
+        s = (await c.post("/api/auth/google", json={"id_token": id_token("tsub-locked", email)})).json()
+        h = {"Authorization": f"Bearer {s['access_token']}"}
+
+        pw = await c.post("/api/user/change-password", headers=h,
+                          json={"current_password": "x", "new_password": "Str0ng!Passw0rd"})
+        assert pw.status_code == 400 and "no password" in pw.json()["detail"]
+
+        em = await c.post("/api/user/change-email", headers=h,
+                          json={"password": "x", "new_email": f"{uniq()}@example.com"})
+        assert em.status_code == 400 and "provider" in em.json()["detail"].lower()
+
+        row = await db.fetchrow("select email, password_hash from users where email = $1", email)
+        assert row and row["password_hash"] is None, "google account gained a password"
+        await cleanup(email)
+
+    run(t)
+
+
+def test_profile_endpoint_cannot_be_used_to_bypass_email_confirmation():
+    """/profile must not change the sign-in email - that would skip the password check on
+    /user/change-email (and the social-account refusal) entirely."""
+    email = f"{uniq()}@example.com"
+    hijack = f"{uniq()}@example.com"
+
+    async def t(c):
+        s = (await c.post("/api/auth/google", json={"id_token": id_token("tsub-bypass", email)})).json()
+        h = {"Authorization": f"Bearer {s['access_token']}"}
+        r = await c.put("/api/user/health-profile", headers=h, json={"email": hijack})
+        assert r.status_code == 400, f"profile endpoint changed the email ({r.status_code})"
+        row = await db.fetchrow("select email from users where user_id = $1", s["user"]["user_id"])
+        assert row["email"] == email, "email was changed without confirmation"
+        await cleanup(email, hijack)
+
+    run(t)
+
+
+def test_google_user_can_still_edit_name_and_username():
+    """Locking email/password must not lock the fields they SHOULD be able to set."""
+    email = f"{uniq()}@example.com"
+
+    async def t(c):
+        s = (await c.post("/api/auth/google", json={"id_token": id_token("tsub-editable", email)})).json()
+        h = {"Authorization": f"Bearer {s['access_token']}"}
+        newname, newuser = "Chosen Name", uniq("handle")
+        r = await c.put("/api/user/health-profile", headers=h, json={"name": newname, "username": newuser})
+        assert r.status_code == 200, r.text
+        row = await db.fetchrow("select name, username from users where user_id = $1", s["user"]["user_id"])
+        assert row["name"] == newname and row["username"] == newuser
+        await cleanup(email)
+
+    run(t)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
