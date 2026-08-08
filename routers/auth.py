@@ -175,17 +175,32 @@ async def _unique_username(base: str) -> str:
 async def _social_login(provider: str, provider_sub: str, email: str, name: str | None, picture: str | None):
     """Find-or-create a user for a verified social identity, link by email, return a token pair."""
     id_col = f"{provider}_id"  # google_id | apple_id
-    user = await db.fetchrow(f"select * from users where {id_col} = $1 or email = $2", provider_sub, email)
+    # Two rows can match at once: the account that owns this provider sub, and a different
+    # account that happens to hold the same email (e.g. the sub's owner changed their Folin
+    # email and a stranger later registered with the freed address). The sub is the identity
+    # the provider actually vouched for, so it always wins - without the ORDER BY, Postgres
+    # picks arbitrarily and the stranger's account can be handed out.
+    user = await db.fetchrow(
+        # `is not distinct from` (not `=`) so an unlinked row yields false, not NULL -
+        # `desc` defaults to NULLS FIRST and would sort the unlinked row to the top.
+        f"""select * from users where {id_col} = $1 or email = $2
+            order by ({id_col} is not distinct from $1) desc limit 1""",
+        provider_sub, email,
+    )
     if user:
-        updates = {id_col: provider_sub}
+        # Never repoint an existing link at a new sub: the row already belongs to someone.
+        # Matched-by-email is still a valid login (the provider verified the address), it
+        # just doesn't get to claim the link.
+        updates = {} if user.get(id_col) else {id_col: provider_sub}
         if not user.get("picture") and picture:
             updates["picture"] = picture
         if not user.get("name") and name:
             updates["name"] = name
-        sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(updates))
-        await db.execute(f"update users set {sets} where user_id = $1", user["user_id"], *updates.values())
-        cache.invalidate(user["user_id"])
-        user = await db.fetchrow("select * from users where user_id = $1", user["user_id"])
+        if updates:
+            sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(updates))
+            await db.execute(f"update users set {sets} where user_id = $1", user["user_id"], *updates.values())
+            cache.invalidate(user["user_id"])
+            user = await db.fetchrow("select * from users where user_id = $1", user["user_id"])
     else:
         username = await _unique_username(email.split("@")[0])
         user = {
