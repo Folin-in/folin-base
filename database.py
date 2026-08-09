@@ -164,6 +164,21 @@ create table if not exists plan_history (
 );
 create index if not exists plan_history_user on plan_history (user_id, created_at desc);
 
+-- Razorpay orders. The amount is written when the order is created and re-checked at
+-- verification, so a tampered client can never buy Pro for less. razorpay_payment_id is
+-- unique: replaying a captured payment to re-activate Pro hits the constraint, not a check.
+create table if not exists payments (
+  order_id text primary key,       -- razorpay order id
+  user_id text not null,
+  amount_inr int not null,         -- server-decided, never from the client
+  currency text not null default 'INR',
+  status text not null,            -- created | paid | failed
+  razorpay_payment_id text unique,
+  created_at text not null,
+  paid_at text
+);
+create index if not exists payments_user on payments (user_id, created_at desc);
+
 -- Accuracy feedback: one row per (report, biomarker) - biomarker_index null = whole report.
 -- id encodes the uniqueness key so upserts are a plain on-conflict.
 create table if not exists report_feedback (
