@@ -70,6 +70,10 @@ alter table reports add column if not exists deleted_at text;
 alter table reports add column if not exists analysis_meta jsonb;
 alter table users add column if not exists google_id text;
 alter table users add column if not exists apple_id text;
+-- Supabase Auth mapping. auth.users owns the credential; this row owns everything
+-- Folin knows about the person. Keeping our own user_id as the primary key means the
+-- 15 tables that reference it (and their cascade FKs) need no migration at all.
+alter table users add column if not exists supabase_uid uuid unique;
 alter table users add column if not exists consented_at text;
 alter table users add column if not exists consent_version text;
 create table if not exists members (
