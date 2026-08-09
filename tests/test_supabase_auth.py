@@ -46,8 +46,8 @@ class _FakeJWKS:
 
 security._SUPABASE_JWKS = _FakeJWKS(_key.public_key())
 
-_LOOP = asyncio.new_event_loop()
-asyncio.set_event_loop(_LOOP)
+# One loop for the whole run, owned by conftest - see its docstring.
+_LOOP = asyncio.get_event_loop()
 _ready = False
 
 

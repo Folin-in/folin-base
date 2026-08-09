@@ -23,8 +23,8 @@ import database as db  # noqa: E402
 from routers.payments import expected_signature  # noqa: E402
 from server import app  # noqa: E402
 
-_LOOP = asyncio.new_event_loop()
-asyncio.set_event_loop(_LOOP)
+# One loop for the whole run, owned by conftest - see its docstring.
+_LOOP = asyncio.get_event_loop()
 _ready = False
 
 
