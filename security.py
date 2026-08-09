@@ -4,6 +4,7 @@ from typing import Optional
 
 import bcrypt
 import jwt
+import jwt as pyjwt
 from fastapi import HTTPException, Request
 
 import cache
@@ -107,6 +108,56 @@ async def _expire_pro_if_due(user: dict) -> dict:
 
 
 # ---------- Auth dependency (JWT) ----------
+# Supabase signs its access tokens with a rotating asymmetric key (ES256) published at
+# the project's JWKS endpoint, so verification needs no shared secret. PyJWKClient caches
+# the fetched keys, so this costs one HTTPS call per process.
+_SUPABASE_JWKS = pyjwt.PyJWKClient(f"{config.SUPABASE_URL}/auth/v1/.well-known/jwks.json") \
+    if config.SUPABASE_URL else None
+
+
+def decode_supabase_token(token: str) -> Optional[dict]:
+    """Verify a Supabase Auth access token. Returns claims, or None if it isn't one."""
+    if not _SUPABASE_JWKS:
+        return None
+    try:
+        key = _SUPABASE_JWKS.get_signing_key_from_jwt(token).key
+        claims = pyjwt.decode(
+            token, key, algorithms=["ES256", "RS256"], audience="authenticated",
+            issuer=f"{config.SUPABASE_URL}/auth/v1",
+        )
+    except Exception:
+        return None
+    return claims if claims.get("sub") else None
+
+
+async def _user_from_supabase(claims: dict) -> dict:
+    """Resolve a Supabase identity to the Folin row that owns the person's data.
+
+    Links by email on first sight so an account created before the migration keeps its
+    reports, family and plan instead of silently starting over.
+    """
+    import uuid as _uuid
+    try:
+        uid = str(_uuid.UUID(str(claims["sub"])))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired sign-in. Please try again.")
+    user = await db.fetchrow("select * from users where supabase_uid = $1", uid)
+    if user:
+        return user
+    email = (claims.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=401, detail="That sign-in has no email address.")
+    user = await db.fetchrow("select * from users where email = $1", email)
+    if not user:
+        raise HTTPException(status_code=401, detail="No Folin account for that sign-in.")
+    if user.get("supabase_uid"):
+        # Already claimed by a different Supabase identity - refuse rather than repoint.
+        raise HTTPException(status_code=409, detail="That email is already linked to another sign-in.")
+    await db.execute("update users set supabase_uid = $1 where user_id = $2", uid, user["user_id"])
+    cache.invalidate(user["user_id"])
+    return await db.fetchrow("select * from users where user_id = $1", user["user_id"])
+
+
 async def get_current_user(request: Request) -> dict:
     auth = request.headers.get("Authorization") or ""
     if not auth.startswith("Bearer "):
@@ -130,5 +181,11 @@ async def get_current_user(request: Request) -> dict:
         if token_tv < current_tv:
             raise HTTPException(status_code=401, detail="Token revoked. Please sign in again.")
         return await _expire_pro_if_due(user)
+
+    # Not one of ours - try Supabase Auth. Both are accepted during the migration so
+    # existing sessions keep working while clients move over.
+    claims = decode_supabase_token(token)
+    if claims:
+        return await _expire_pro_if_due(await _user_from_supabase(claims))
 
     raise HTTPException(status_code=401, detail="Invalid or expired token")

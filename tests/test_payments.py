@@ -19,12 +19,13 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 import httpx  # noqa: E402
 
 import config  # noqa: E402
+import rate_limit  # noqa: E402
 import database as db  # noqa: E402
 from routers.payments import expected_signature  # noqa: E402
 from server import app  # noqa: E402
 
-_LOOP = asyncio.new_event_loop()
-asyncio.set_event_loop(_LOOP)
+# One loop for the whole run, owned by conftest - see its docstring.
+_LOOP = asyncio.get_event_loop()
 _ready = False
 
 
@@ -34,6 +35,10 @@ def run(coro):
         if not _ready:
             await db.connect()
             _ready = True
+        # Each test starts on a fresh throttle window: register is capped at 10 per 10
+        # minutes per IP, which a combined run blows through and then fails in a way that
+        # looks like a payments bug.
+        rate_limit._WINDOWS.clear()
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             return await coro(c)
