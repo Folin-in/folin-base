@@ -17,7 +17,7 @@ from email_service import send_password_reset, smtp_enabled
 from models import (ForgotPasswordRequest, LoginRequest, RegisterRequest,
                     ResetPasswordRequest, default_preferences, public_user)
 from rate_limit import check_and_increment_daily_quota, check_ip_rate_limit
-from security import (create_access_token, get_current_user, hash_password, hash_refresh,
+from security import (create_access_token, decode_supabase_token, get_current_user, hash_password, hash_refresh,
                       issue_refresh_token, revoke_all_refresh_tokens, revoke_refresh_family,
                       verify_password)
 
@@ -230,6 +230,98 @@ async def google_login(req: GoogleLoginRequest, request: Request):
     if not email or not claims.get("email_verified", False):
         raise HTTPException(status_code=401, detail="Your Google account has no verified email.")
     return await _social_login("google", claims["sub"], email, claims.get("name"), claims.get("picture"))
+
+
+# ---------- Supabase Auth ----------
+class SupabaseSyncRequest(BaseModel):
+    # Only used when the identity is brand new; ignored for an existing account.
+    name: str | None = None
+    username: str | None = None
+    consent: bool = False
+
+
+@router.post("/supabase/sync")
+async def supabase_sync(req: SupabaseSyncRequest, request: Request):
+    """Exchange a verified Supabase identity for a Folin account.
+
+    Supabase owns the credential; this row owns everything Folin knows about the person.
+    Three cases:
+      - already linked  -> return it
+      - email matches an existing Folin account -> claim it, keeping reports/family/plan
+      - brand new -> create the row (consent required, same as email signup)
+
+    The client keeps using its Supabase access token afterwards; get_current_user accepts
+    both issuers, so no Folin-issued token is minted here.
+    """
+    if not config.SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase login is not configured.")
+    check_ip_rate_limit(request, bucket="social_login", max_hits=20, window_seconds=300)
+
+    auth_header = request.headers.get("Authorization") or ""
+    token = auth_header.split(" ", 1)[1].strip() if auth_header.startswith("Bearer ") else ""
+    claims = decode_supabase_token(token) if token else None
+    if not claims:
+        raise HTTPException(status_code=401, detail="Invalid or expired sign-in. Please try again.")
+
+    # supabase_uid is a uuid column; a non-uuid sub would raise a DataError (500) deeper in.
+    try:
+        uid = str(uuid.UUID(str(claims["sub"])))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired sign-in. Please try again.")
+    email = (claims.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=401, detail="That sign-in has no email address.")
+    # Supabase reports verification per-identity; an unverified email must not be able to
+    # claim an existing Folin account by matching on it.
+    email_verified = bool(claims.get("email_verified") or (claims.get("user_metadata") or {}).get("email_verified"))
+
+    user = await db.fetchrow("select * from users where supabase_uid = $1", uid)
+    if not user:
+        existing = await db.fetchrow("select * from users where lower(email) = $1", email)
+        if existing:
+            if existing.get("supabase_uid"):
+                raise HTTPException(status_code=409, detail="That email is already linked to another sign-in.")
+            if not email_verified:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Please confirm your email first - it already belongs to a Folin account.",
+                )
+            await db.execute("update users set supabase_uid = $1 where user_id = $2", uid, existing["user_id"])
+            cache.invalidate(existing["user_id"])
+            user = await db.fetchrow("select * from users where user_id = $1", existing["user_id"])
+        else:
+            if not req.consent:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please confirm you're 18+ and consent to health-data processing to create an account.",
+                )
+            meta = claims.get("user_metadata") or {}
+            now = _now()
+            username = await _unique_username((req.username or "").strip() or email.split("@")[0])
+            new = {
+                "user_id": f"user_{uuid.uuid4().hex[:12]}",
+                "email": email,
+                "username": username,
+                "name": (req.name or meta.get("full_name") or meta.get("name") or "").strip() or username,
+                "password_hash": None,  # Supabase holds the credential
+                "auth_provider": "supabase",
+                "supabase_uid": uid,
+                "picture": meta.get("avatar_url") or meta.get("picture"),
+                "health_profile": {},
+                "preferences": default_preferences(),
+                "token_version": 0,
+                "created_at": now.isoformat(),
+                "consented_at": now.isoformat(),
+                "consent_version": config.CONSENT_VERSION,
+            }
+            cols = list(new.keys())
+            await db.execute(
+                f"insert into users ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))})",
+                *new.values(),
+            )
+            user = await db.fetchrow("select * from users where user_id = $1", new["user_id"])
+
+    return {"user": public_user(user)}
 
 
 @router.post("/apple")
