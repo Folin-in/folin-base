@@ -292,7 +292,9 @@ async def supabase_sync(req: SupabaseSyncRequest, request: Request):
 
     user = await db.fetchrow("select * from users where supabase_uid = $1", uid)
     if not user:
-        existing = await db.fetchrow("select * from users where lower(email) = $1", email)
+        # email is normalised to lowercase on every write path, so plain equality hits
+        # the unique index - lower(email) would force a sequential scan forever.
+        existing = await db.fetchrow("select * from users where email = $1", email)
         if existing:
             if existing.get("supabase_uid"):
                 raise HTTPException(status_code=409, detail="That email is already linked to another sign-in.")

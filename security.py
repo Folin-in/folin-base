@@ -147,7 +147,7 @@ async def _user_from_supabase(claims: dict) -> dict:
     email = (claims.get("email") or "").lower().strip()
     if not email:
         raise HTTPException(status_code=401, detail="That sign-in has no email address.")
-    user = await db.fetchrow("select * from users where lower(email) = $1", email)
+    user = await db.fetchrow("select * from users where email = $1", email)
     if not user:
         raise HTTPException(status_code=401, detail="No Folin account for that sign-in.")
     if user.get("supabase_uid"):
