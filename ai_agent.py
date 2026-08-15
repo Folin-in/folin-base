@@ -113,9 +113,14 @@ async def run_ai_analysis(files: list[tuple[str, str]], profile_context: str,
                           language: str = "english", meta: dict | None = None) -> dict:
     """files: list of (file_path, mime_type). Multiple files are pages of ONE document
     (images only - enforced upstream in the router)."""
+    # Multiple photos are MEANT to be pages of one report, but the user can just as easily
+    # pick three different patients' reports by mistake. So: verify they belong together
+    # first (pages_coherent), and only merge when they do. Blending different documents
+    # into one report is the worst possible outcome - it looks like a real result.
     page_note = (
-        f" The document is provided as {len(files)} photos - treat them as consecutive pages of "
-        "ONE single report and merge all findings into one result."
+        f" The document is provided as {len(files)} photos. First apply the MULTI-PHOTO RULE: "
+        "confirm they are pages of the SAME report (same patient, provider, date). Only if they "
+        "are, treat them as consecutive pages and merge all findings into one result."
         if len(files) > 1 else ""
     )
     text = f"Analyze this medical document and return JSON matching the correct report_type.{page_note} {profile_context}"

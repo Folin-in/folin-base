@@ -18,6 +18,7 @@ import cache
 import config
 import database as db
 import storage
+from ai_guard import DocumentRejected, audit_output, screen_document
 from ai_agent import reconcile_tips, refresh_marker_advice, run_ai_analysis, verify_biomarkers
 from ai_tools import build_profile_context
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
@@ -146,6 +147,18 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
 
         analyze_meta: dict = {"kind": "analyze", "user_id": user_id}
         verify_meta: dict = {}
+        # GATE 1 - screen before the extractor ever sees the file. A separate model call
+        # with no extraction task, so an injected instruction has nothing to hijack. A
+        # rejection here is the user's problem (bad/manipulated file), so it is a 422 and
+        # the job runner refunds the quota.
+        try:
+            await screen_document(attachments, meta={"user_id": user_id})
+        except DocumentRejected as rej:
+            logger.warning(f"document rejected at screen: {rej.reason} :: {rej.evidence}")
+            raise HTTPException(status_code=422, detail=rej.user_message)
+        except Exception as e:
+            logger.error(f"screen failed: {e}")
+            raise HTTPException(status_code=502, detail="AI analysis failed. Please try again in a moment.")
         try:
             parsed = await run_ai_analysis(attachments, profile_context, language=language, meta=analyze_meta)
         except (ValueError, json.JSONDecodeError) as e:
@@ -157,11 +170,31 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
             logger.error(f"AI analysis failed: {e}")
             raise HTTPException(status_code=502, detail="AI analysis failed. Please try again in a moment.")
 
+        # GATE 2 - deterministic audit of what the extractor produced. Catches an obeyed
+        # instruction that slipped past the screen, and any wellness-boundary breach.
+        try:
+            audit_output(parsed)
+        except DocumentRejected as rej:
+            logger.warning(f"document rejected at audit: {rej.reason} :: {rej.evidence}")
+            raise HTTPException(status_code=422, detail=rej.user_message)
+
         report_type = str(parsed.get("report_type") or "").strip().lower()
         if not report_type and parsed.get("is_blood_report"):
             report_type = "lab"
         if report_type == "unknown":
             raise HTTPException(status_code=400, detail="This doesn't look like a medical document. Try a different file.")
+        # Multi-photo uploads must be pages of ONE report. If the model saw different
+        # patients / labs / dates across the photos, refuse rather than produce a blended
+        # report that looks real. 422 (not 400) so the job runner refunds the quota - the
+        # user made a mistake, they didn't burn an analysis.
+        if len(_req_files(req)) > 1 and parsed.get("pages_coherent") is False:
+            issue = str(parsed.get("pages_issue") or "").strip()
+            raise HTTPException(
+                status_code=422,
+                detail="These photos don't look like pages of the same report. "
+                       + (issue + " " if issue else "")
+                       + "Upload one report at a time, with all of its pages together.",
+            )
         if report_type not in REPORT_TYPES:
             report_type = "lab" if parsed.get("biomarkers") else "other"
 
@@ -417,8 +450,9 @@ async def _run_analyze_job(job_id: str, req: AnalyzeRequest, user_id: str, curre
             "update analyze_jobs set status = 'error', completed_at = $1, error = $2 where job_id = $3",
             _iso(), str(e.detail), job_id,
         )
-        # Refund quota only for retryable errors - unknown-document (400) should still count.
-        if e.status_code >= 500:
+        # Refund quota for retryable errors (5xx) and for mixed-document uploads (422) -
+        # neither produced a report. Unknown-document (400) still counts: it did the work.
+        if e.status_code >= 500 or e.status_code == 422:
             await refund_daily_quota(user_id)
     except Exception as e:
         logger.exception(f"analyze job {job_id} crashed")
