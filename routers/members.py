@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 
 import cache
-import database as db
+from db import session as db
 from models import GENDERS, MEMBER_RELATIONS, MemberUpsertRequest
 from security import get_current_user
 

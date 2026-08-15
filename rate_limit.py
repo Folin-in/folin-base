@@ -11,7 +11,7 @@ from typing import Deque, Dict, Tuple
 from fastapi import HTTPException, Request
 
 import config
-import database as db
+from db import session as db
 
 
 # ---------- In-memory per-IP sliding window ----------

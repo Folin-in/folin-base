@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import cache
 import config
-import database as db
+from db import session as db
 import storage
 from gamification import EVENT_XP, compute_profile, sort_by_effective_date
 from models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, ChangeEmailRequest,

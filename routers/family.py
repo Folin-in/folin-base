@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 
 import cache
-import database as db
+from db import session as db
 from email_service import send_family_invite
 from gamification import compute_profile
 from models import FamilyInviteRequest, RELATIONSHIPS

@@ -8,6 +8,8 @@ remote Postgres round-trip.
 """
 from time import monotonic
 
+from db import session as db
+
 _TTL_SECONDS = 30.0
 _store: dict[str, tuple[float, dict]] = {}
 
@@ -46,7 +48,6 @@ async def get_reports(user_id: str) -> list[dict]:
     entry = _reports.get(user_id)
     if entry and monotonic() - entry[0] <= _REPORTS_TTL:
         return entry[1]
-    import database as db
     rows = await db.fetch("select * from reports where user_id = $1 and deleted_at is null limit 1000", user_id)
     _reports[user_id] = (monotonic(), rows)
     if len(_reports) > 2_000:
@@ -67,14 +68,12 @@ _tips_verdicts: dict = {}
 _TIPS_TTL = 24 * 3600
 
 def get_tips_verdict(key: str):
-    import time as _t
     hit = _tips_verdicts.get(key)
-    if hit and _t.monotonic() - hit[0] < _TIPS_TTL:
+    if hit and time.monotonic() - hit[0] < _TIPS_TTL:
         return hit[1]
     return None
 
 def set_tips_verdict(key: str, drop: list) -> None:
-    import time as _t
     if len(_tips_verdicts) > 500:
         _tips_verdicts.clear()
-    _tips_verdicts[key] = (_t.monotonic(), drop)
+    _tips_verdicts[key] = (time.monotonic(), drop)

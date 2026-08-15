@@ -20,7 +20,7 @@ import httpx  # noqa: E402
 
 import config  # noqa: E402
 import rate_limit  # noqa: E402
-import database as db  # noqa: E402
+from db import session as db  # noqa: E402
 from routers.payments import expected_signature  # noqa: E402
 from server import app  # noqa: E402
 

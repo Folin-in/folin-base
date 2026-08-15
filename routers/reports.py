@@ -10,29 +10,36 @@ import re as _re
 from re import escape as _re_escape, search as _re_search
 import tempfile
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import cache
 import config
-import database as db
+from db import session as db
 import storage
-from ai_guard import DocumentRejected, audit_output, screen_document
-from ai_agent import reconcile_tips, refresh_marker_advice, run_ai_analysis, verify_biomarkers
-from ai_tools import build_profile_context
+from agents import AdviceRefresher, TipsReconciler
+from agents.base import ModelUnavailable
+from services.analysis import (MSG_PROVIDER, AnalysisRejected, InvalidUpload, UnsupportedDocument,
+                               pipeline)
+from agents.tools import TOOLS
 from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
 from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, BiomarkerPatch,
                     Medication, Report, ReportFeedbackIn, ReportTitleUpdate, Suggestion)
 from rate_limit import check_and_increment_daily_quota, refund_daily_quota
-from routers.members import resolve_member_profile
-from routers.users import fetch_events
-from sanity import _parse_range as _parse_ref_bounds, sanity_note
+from services.engagement import fetch_events
+from services.members import member_id_of as _member_id_of, resolve_member_profile
+from agents.tools.sanity_bounds import parse_range as _parse_ref_bounds
 from security import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/reports", tags=["reports"])
+_reconciler = TipsReconciler()
+_refresher = AdviceRefresher()
+_profile_context = TOOLS["profile_context"]
+_names_match = TOOLS["name_match"]
+_sanity_note = TOOLS["sanity_bounds"]
 
 ALLOWED_MIME = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 SUGGESTION_CATEGORIES = {"nutrition", "movement", "sleep", "supplements", "lifestyle"}
@@ -70,28 +77,6 @@ def _valid_id(report_id: str) -> bool:
         return False
 
 
-_NAME_TITLES = {"mr", "mrs", "ms", "miss", "mx", "dr", "master", "shri", "smt", "sri", "kumari", "baby"}
-
-
-def _name_tokens(name: str) -> set[str]:
-    return {t for t in _re.sub(r"[^a-z ]", " ", name.lower()).split() if len(t) > 1 and t not in _NAME_TITLES}
-
-
-def _names_match(profile_name: str | None, patient_name: str | None) -> bool:
-    """Lenient: any shared name token (or substring token) counts as a match. Only a
-    complete disjoint - e.g. profile 'Ketan Raj' vs report 'Sunita Sharma' - is a mismatch.
-    Missing either name = no judgement (returns True)."""
-    a, b = _name_tokens(profile_name or ""), _name_tokens(patient_name or "")
-    if not a or not b:
-        return True
-    if a & b:
-        return True
-    return any(x in y or y in x for x in a for y in b)
-
-
-def _member_id_of(member_id: str | None) -> str:
-    return (member_id or "self").strip() or "self"
-
 
 async def _member_reports(user_id: str, member_id: str | None, lab_only: bool = False) -> list[dict]:
     mid = _member_id_of(member_id)
@@ -103,319 +88,22 @@ async def _member_reports(user_id: str, member_id: str | None, lab_only: bool = 
 
 
 async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: dict) -> dict:
-    """The actual AI analyze work. Returns {report_id, report, xp_earned, new_badges, profile}.
-    Extracted so it can run in a background task detached from the request lifecycle.
-    Raises HTTPException on user-facing errors, generic Exception on unexpected failures.
-    """
-    files = _req_files(req)
-    raws: list[bytes] = []
-    for f in files:
-        try:
-            raws.append(base64.b64decode(f.file_base64, validate=False))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid file data.")
-    if sum(len(r) for r in raws) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF.")
-
-    member_id = _member_id_of(req.member_id)
-    display_name, hp = await resolve_member_profile(current_user_snapshot, member_id)
-    language = (hp.get("language") or "english").lower()
-    profile_context = build_profile_context(display_name or current_user_snapshot.get("name", ""), hp)
-
-    existing = sort_by_effective_date(await _member_reports(user_id, member_id))
-    if existing:
-        prev = existing[-1]
-        prev_date = effective_date(prev) or (prev.get("uploaded_at", "")[:10])
-        flagged = [
-            f"{b.get('name')}: {b.get('value')} {b.get('unit', '')} ({b.get('status')})"
-            for b in prev.get("biomarkers", []) if b.get("status") != "normal"
-        ]
-        profile_context += (
-            f" PREVIOUS REPORT ({prev_date}, score {prev.get('health_score')}): "
-            + ("flagged markers were " + "; ".join(flagged) if flagged else "all markers were in range")
-            + ". Compare new values against these where the same marker appears and explicitly mention improvements or declines."
-        )
-
-    tmp_paths: list[str] = []
+    """Adapter: run the AnalysisPipeline and translate its outcomes into HTTP semantics.
+    422 = the user's file was the problem (quota refunded by the job runner);
+    400 = not a medical document (still counts); 502 = provider fault (refunded)."""
     try:
-        attachments: list[tuple[str, str]] = []
-        for f, raw in zip(files, raws):
-            with tempfile.NamedTemporaryFile(suffix=ALLOWED_MIME[f.mime_type], delete=False) as tmp:
-                tmp.write(raw)
-                tmp_paths.append(tmp.name)
-                attachments.append((tmp.name, f.mime_type))
-
-        analyze_meta: dict = {"kind": "analyze", "user_id": user_id}
-        verify_meta: dict = {}
-        # GATE 1 - screen before the extractor ever sees the file. A separate model call
-        # with no extraction task, so an injected instruction has nothing to hijack. A
-        # rejection here is the user's problem (bad/manipulated file), so it is a 422 and
-        # the job runner refunds the quota.
-        try:
-            await screen_document(attachments, meta={"user_id": user_id})
-        except DocumentRejected as rej:
-            logger.warning(f"document rejected at screen: {rej.reason} :: {rej.evidence}")
-            raise HTTPException(status_code=422, detail=rej.user_message)
-        except Exception as e:
-            logger.error(f"screen failed: {e}")
-            raise HTTPException(status_code=502, detail="AI analysis failed. Please try again in a moment.")
-        try:
-            parsed = await run_ai_analysis(attachments, profile_context, language=language, meta=analyze_meta)
-        except (ValueError, json.JSONDecodeError) as e:
-            logger.error(f"AI JSON parse failure: {e}")
-            raise HTTPException(status_code=502, detail="The AI couldn't read this report. Please try again or use a clearer file.")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"AI analysis failed: {e}")
-            raise HTTPException(status_code=502, detail="AI analysis failed. Please try again in a moment.")
-
-        # GATE 2 - deterministic audit of what the extractor produced. Catches an obeyed
-        # instruction that slipped past the screen, and any wellness-boundary breach.
-        try:
-            audit_output(parsed)
-        except DocumentRejected as rej:
-            logger.warning(f"document rejected at audit: {rej.reason} :: {rej.evidence}")
-            raise HTTPException(status_code=422, detail=rej.user_message)
-
-        report_type = str(parsed.get("report_type") or "").strip().lower()
-        if not report_type and parsed.get("is_blood_report"):
-            report_type = "lab"
-        if report_type == "unknown":
-            raise HTTPException(status_code=400, detail="This doesn't look like a medical document. Try a different file.")
-        # Multi-photo uploads must be pages of ONE report. If the model saw different
-        # patients / labs / dates across the photos, refuse rather than produce a blended
-        # report that looks real. 422 (not 400) so the job runner refunds the quota - the
-        # user made a mistake, they didn't burn an analysis.
-        if len(_req_files(req)) > 1 and parsed.get("pages_coherent") is False:
-            issue = str(parsed.get("pages_issue") or "").strip()
-            raise HTTPException(
-                status_code=422,
-                detail="These photos don't look like pages of the same report. "
-                       + (issue + " " if issue else "")
-                       + "Upload one report at a time, with all of its pages together.",
-            )
-        if report_type not in REPORT_TYPES:
-            report_type = "lab" if parsed.get("biomarkers") else "other"
-
-        biomarkers = []
-        for b in parsed.get("biomarkers", []):
-            try:
-                biomarkers.append(Biomarker(
-                    name=str(b.get("name", "")).strip(),
-                    value=str(b.get("value", "")).strip(),
-                    unit=str(b.get("unit") or "").strip(),
-                    ref_range=str(b.get("ref_range") or "").strip(),
-                    status=b.get("status") if b.get("status") in STATUS_WEIGHT else "normal",
-                    category=str(b.get("category") or "Other").strip(),
-                    explanation=str(b.get("explanation") or "").strip(),
-                    tip=str(b.get("tip") or "").strip(),
-                ))
-            except Exception:
-                continue
-
-        # Sanity guardrails (free, instant): flag implausible values / status-range contradictions.
-        for b in biomarkers:
-            note = sanity_note(b.model_dump())
-            if note:
-                b.needs_verification = True
-                b.verification_note = note
-
-        # PRO self-check: second AI pass cross-checks every value/status against the document.
-        plan = ((current_user_snapshot.get("preferences") or {}).get("plan")) or "free"
-        if plan == "pro" and biomarkers:
-            verify_meta.update({"kind": "verify", "user_id": user_id})
-            try:
-                mismatches = await verify_biomarkers(attachments, [b.model_dump() for b in biomarkers], meta=verify_meta)
-                by_name = {str(m.get("name", "")).strip().lower(): m for m in mismatches}
-                for b in biomarkers:
-                    m = by_name.get(b.name.strip().lower())
-                    if m:
-                        b.needs_verification = True
-                        issue = str(m.get("issue") or "").strip()
-                        expected = str(m.get("expected") or "").strip()
-                        b.verification_note = (
-                            (issue or "This value may not match the document - please double-check.")
-                            + (f" (Document shows: {expected})" if expected else "")
-                        )[:300]
-            except Exception as e:
-                logger.warning(f"AI self-check failed (skipping): {e}")
-
-        suggestions = []
-        for s in parsed.get("suggestions", []) or []:
-            try:
-                cat = _normalize_category(s.get("category"))
-                linked = s.get("linked_marker")
-                suggestions.append(Suggestion(
-                    title=str(s.get("title", "")).strip(),
-                    body=str(s.get("body", "")).strip(),
-                    category=cat,
-                    linked_marker=str(linked).strip() if linked else None,
-                ))
-            except Exception:
-                continue
-
-        # BMI from the profile as a first-class marker: shows in the report's marker list,
-        # counts in in-range totals, and feeds the weighted health score like any other test.
-        # Members (sub-profiles) don't carry weight/height, so this is naturally self-only.
-        w, h = hp.get("weight_kg"), hp.get("height_cm")
-        if report_type == "lab" and w and h and not any(b.name.strip().lower() == "bmi" for b in biomarkers):
-            bmi = round(w / ((h / 100) ** 2), 1)
-            if bmi < 17:
-                bmi_status = "low"
-            elif bmi < 18.5:
-                bmi_status = "borderline_low"
-            elif bmi < 25:
-                bmi_status = "normal"
-            elif bmi < 30:
-                bmi_status = "borderline_high"
-            else:
-                bmi_status = "high"
-            biomarkers.append(Biomarker(
-                name="BMI",
-                value=str(bmi),
-                unit="kg/m²",
-                ref_range="18.5 - 24.9",
-                status=bmi_status,
-                category="Other",
-                explanation=f"Body Mass Index, worked out from your profile ({w} kg, {h} cm). It's a rough gauge of weight for your height - not a full picture of health on its own.",
-                tip="This comes from your profile, not the lab report - keep your weight and height up to date there so it stays accurate.",
-            ))
-
-        bio_dicts = [b.model_dump() for b in biomarkers]
-        if report_type == "lab" and bio_dicts:
-            health_score = compute_health_score(bio_dicts)
-        else:
-            positives_raw = [str(p).strip() for p in (parsed.get("positives") or []) if str(p).strip()]
-            concerns_raw = [str(c).strip() for c in (parsed.get("concerns") or []) if str(c).strip()]
-            health_score = compute_document_score(positives_raw, concerns_raw)
-        normal_count = sum(1 for b in bio_dicts if b["status"] == "normal")
-        attention_count = sum(1 for b in bio_dicts if b["status"] in ("high", "low"))
-
-        medications: list[Medication] = []
-        for m in parsed.get("medications") or []:
-            try:
-                name = str(m.get("name") or "").strip()
-                if not name:
-                    continue
-                medications.append(Medication(
-                    name=name,
-                    dose=(str(m["dose"]).strip() if m.get("dose") else None),
-                    schedule=(str(m["schedule"]).strip() if m.get("schedule") else None),
-                    duration=(str(m["duration"]).strip() if m.get("duration") else None),
-                    purpose=(str(m["purpose"]).strip() if m.get("purpose") else None),
-                ))
-            except Exception:
-                continue
-
-        def _str_list(key: str) -> list[str]:
-            v = parsed.get(key) or []
-            # Model occasionally returns a single string instead of a list - iterating it
-            # would produce one-character items.
-            if isinstance(v, str):
-                v = [v]
-            return [str(x).strip() for x in v if str(x).strip()]
-
-        summary_text = _re.sub(r"\s*\(?\b\d{1,3}\s*/\s*100\b\)?", "", str(parsed.get("summary") or "")).strip()
-        lab_or_provider = parsed.get("lab_name") or parsed.get("provider")
-
-        patient_name = parsed.get("patient_name")
-        name_mismatch = not _names_match(display_name, str(patient_name) if patient_name else None)
-
-        # Keep the original document in Supabase Storage so the user can re-view it.
-        # Best-effort: analysis result is stored either way. Multi-page uploads store
-        # every page; paths are comma-joined in the single storage_path text column
-        # (paths are "<uuid>/<hex><ext>" - never contain commas).
-        stored_paths: list[str] = []
-        for f, raw in zip(files, raws):
-            page_path = f"{user_id}/{uuid.uuid4().hex}{ALLOWED_MIME[f.mime_type]}"
-            if await storage.upload_report_file(page_path, raw, f.mime_type):
-                stored_paths.append(page_path)
-        storage_path = ",".join(stored_paths) or None
-        file_hash = hashlib.sha256(b"".join(raws)).hexdigest()
-
-        report = Report(
-            user_id=user_id,
-            member_id=member_id,
-            filename=_files_display_name(files),
-            mime_type=files[0].mime_type,
-            storage_path=storage_path,
-            file_hash=file_hash,
-            uploaded_at=datetime.now(timezone.utc).isoformat(),
-            report_type=report_type,
-            report_date=parsed.get("report_date"),
-            patient_name=(str(patient_name).strip() if patient_name else None),
-            name_mismatch=name_mismatch,
-            lab_name=(str(lab_or_provider).strip() if lab_or_provider else None),
-            summary=summary_text,
-            overall_assessment=str(parsed.get("overall_assessment") or ""),
-            positives=_str_list("positives"),
-            concerns=_str_list("concerns"),
-            suggestions=suggestions,
-            biomarkers=biomarkers,
-            health_score=health_score,
-            normal_count=normal_count,
-            attention_count=attention_count,
-            total_count=len(biomarkers),
-            chief_complaint=(str(parsed["chief_complaint"]).strip() if parsed.get("chief_complaint") else None),
-            exam_findings=_str_list("exam_findings"),
-            diagnoses=_str_list("diagnoses"),
-            referrals=_str_list("referrals"),
-            medications=medications,
-            modality=(str(parsed["modality"]).strip() if parsed.get("modality") else None),
-            body_area=(str(parsed["body_area"]).strip() if parsed.get("body_area") else None),
-            findings=_str_list("findings"),
-            impression=(str(parsed["impression"]).strip() if parsed.get("impression") else None),
-            admission_date=parsed.get("admission_date"),
-            discharge_date=parsed.get("discharge_date"),
-            procedures=_str_list("procedures"),
-            follow_up=(str(parsed["follow_up"]).strip() if parsed.get("follow_up") else None),
-        )
-
-        events = await fetch_events(user_id)
-        profile_before = compute_profile(existing, events=events)
-
-        d = report.model_dump(exclude={"id"})
-        cols = list(d.keys())
-        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
-        new_id = await db.fetchval(
-            f"insert into reports ({', '.join(cols)}) values ({placeholders}) returning id",
-            *d.values(),
-        )
-        report.id = str(new_id)
-        # Provenance: which model analyzed this report + a link to the full trajectory.
-        if analyze_meta.get("trajectory_id"):
-            await db.execute(
-                "update reports set analysis_meta = $1 where id = $2::uuid",
-                {"model": analyze_meta.get("model"), "trajectory_id": analyze_meta["trajectory_id"]},
-                report.id,
-            )
-            await db.execute(
-                "update ai_trajectories set report_id = $1 where id = $2",
-                report.id, analyze_meta["trajectory_id"],
-            )
-        if verify_meta.get("trajectory_id"):
-            await db.execute("update ai_trajectories set report_id = $1 where id = $2",
-                             report.id, verify_meta["trajectory_id"])
-        cache.invalidate_reports(user_id)
-
-        all_reports = existing + [report.model_dump()]
-        profile_after = compute_profile(all_reports, events=events)
-
-        before_ids = {b["id"] for b in profile_before["badges"] if b["unlocked"]}
-        new_badges = [b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids]
-
-        return {
-            "report_id": report.id,
-            "report": report.model_dump(),
-            "xp_earned": profile_after["xp"] - profile_before["xp"],
-            "new_badges": new_badges,
-            "profile": profile_after,
-        }
-    finally:
-        for p in tmp_paths:
-            if os.path.exists(p):
-                os.unlink(p)
+        result = await pipeline.run(_req_files(req), user_id, current_user_snapshot, req.member_id)
+    except InvalidUpload as e:
+        raise HTTPException(status_code=e.status, detail=e.user_message)
+    except AnalysisRejected as e:
+        raise HTTPException(status_code=422, detail=e.user_message)
+    except UnsupportedDocument as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ModelUnavailable as e:
+        logger.error("AI analysis failed: %s", e)
+        raise HTTPException(status_code=502, detail=MSG_PROVIDER)
+    return {"report_id": result.report_id, "report": result.report, "xp_earned": result.xp_earned,
+            "new_badges": result.new_badges, "profile": result.profile}
 
 
 async def _run_analyze_job(job_id: str, req: AnalyzeRequest, user_id: str, current_user_snapshot: dict):
@@ -703,7 +391,7 @@ async def list_all_suggestions(
     # Apply a cached verdict instantly; otherwise serve unfiltered now and compute
     # the verdict in the background so the next view has it.
     if len(out) >= 2:
-        ctx = build_profile_context(display_name or current_user.get("name", ""), hp)
+        ctx = _profile_context(display_name or current_user.get("name", ""), hp)
         key = hashlib.sha256(
             (ctx + json.dumps([[t["title"], t["body"], t["report_date"]] for t in out])).encode()
         ).hexdigest()
@@ -714,8 +402,7 @@ async def list_all_suggestions(
 
             async def _warm_verdict():
                 try:
-                    verdict = await reconcile_tips(ctx, snapshot,
-                                                   meta={"kind": "reconcile_tips", "user_id": uid})
+                    verdict = await _reconciler.run(ctx, snapshot, user_id=uid)
                 except Exception as e:
                     logger.warning(f"tips reconcile failed (leaving unfiltered): {e}")
                     verdict = []
@@ -750,8 +437,7 @@ async def retest_reminders(
     latest = docs[0]
     ed = effective_date(latest)
     try:
-        from datetime import date as _date
-        days_ago = (_date.today() - _date.fromisoformat(ed)).days if ed else None
+        days_ago = (date.today() - date.fromisoformat(ed)).days if ed else None
     except ValueError:
         days_ago = None
     flagged = [b for b in latest.get("biomarkers", []) if b.get("status") != "normal"]
@@ -1025,10 +711,10 @@ async def edit_biomarker(
                           if str(sg.get("linked_marker") or "").strip().lower() == marker_name]
             display_name, hp = await resolve_member_profile(current_user, doc.get("member_id") or "self")
             language = (hp.get("language") or "english").lower()
-            fresh_advice = await refresh_marker_advice(
-                build_profile_context(display_name or current_user.get("name", ""), hp),
+            fresh_advice = await _refresher.run(
+                _profile_context(display_name or current_user.get("name", ""), hp),
                 b, [suggestions[i] for i in linked_idx], language=language,
-                meta={"kind": "refresh_advice", "user_id": current_user["user_id"], "report_id": report_id},
+                user_id=current_user["user_id"], report_id=report_id,
             )
             if fresh_advice.get("explanation"):
                 b["explanation"] = str(fresh_advice["explanation"]).strip()

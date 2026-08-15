@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 import cache
 import config
-import database as db
+from db import session as db
 from security import get_current_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])

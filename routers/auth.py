@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import cache
 import config
-import database as db
+from db import session as db
 from email_service import send_password_reset, smtp_enabled
 from models import (ForgotPasswordRequest, LoginRequest, RegisterRequest,
                     ResetPasswordRequest, default_preferences, public_user)

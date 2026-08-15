@@ -5,7 +5,7 @@ from fastapi import APIRouter, FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 import config  # noqa: F401 - loads .env first
-import database
+from db import session as database
 from routers import auth, family, members, payments, reports, users
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

@@ -4,7 +4,9 @@
 """
 import pytest
 
-from ai_guard import DocumentRejected, audit_output
+from agents import DocumentRejected, OutputAuditor
+
+audit_output = OutputAuditor().run
 
 
 def rejects(d):

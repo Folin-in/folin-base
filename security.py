@@ -1,15 +1,17 @@
+import hashlib
 import logging
+import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
 import jwt
-import jwt as pyjwt
 from fastapi import HTTPException, Request
 
 import cache
 import config
-import database as db
+from db import session as db
 
 logger = logging.getLogger(__name__)
 
@@ -48,24 +50,21 @@ def decode_token(token: str) -> Optional[dict]:
 
 # ---------- Refresh tokens (opaque, hashed at rest, single-use rotation) ----------
 def new_refresh_token() -> str:
-    import secrets as _secrets
-    return _secrets.token_urlsafe(48)
+    return secrets.token_urlsafe(48)
 
 
 def hash_refresh(raw: str) -> str:
-    import hashlib as _hashlib
-    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 async def issue_refresh_token(user_id: str, family_id: Optional[str] = None) -> str:
     """Create + store a new refresh token; returns the RAW value (only shown once)."""
-    import secrets as _secrets
     raw = new_refresh_token()
     now = datetime.now(timezone.utc)
     await db.execute(
         """insert into refresh_tokens (token_hash, user_id, family_id, used, revoked_at, created_at, expires_at)
            values ($1, $2, $3, false, null, $4, $5)""",
-        hash_refresh(raw), user_id, family_id or _secrets.token_hex(16),
+        hash_refresh(raw), user_id, family_id or secrets.token_hex(16),
         now, now + timedelta(days=config.REFRESH_TOKEN_DAYS),
     )
     return raw
@@ -111,7 +110,7 @@ async def _expire_pro_if_due(user: dict) -> dict:
 # Supabase signs its access tokens with a rotating asymmetric key (ES256) published at
 # the project's JWKS endpoint, so verification needs no shared secret. PyJWKClient caches
 # the fetched keys, so this costs one HTTPS call per process.
-_SUPABASE_JWKS = pyjwt.PyJWKClient(f"{config.SUPABASE_URL}/auth/v1/.well-known/jwks.json") \
+_SUPABASE_JWKS = jwt.PyJWKClient(f"{config.SUPABASE_URL}/auth/v1/.well-known/jwks.json") \
     if config.SUPABASE_URL else None
 
 
@@ -121,7 +120,7 @@ def decode_supabase_token(token: str) -> Optional[dict]:
         return None
     try:
         key = _SUPABASE_JWKS.get_signing_key_from_jwt(token).key
-        claims = pyjwt.decode(
+        claims = jwt.decode(
             token, key, algorithms=["ES256", "RS256"], audience="authenticated",
             issuer=f"{config.SUPABASE_URL}/auth/v1",
         )
@@ -136,9 +135,8 @@ async def _user_from_supabase(claims: dict) -> dict:
     Links by email on first sight so an account created before the migration keeps its
     reports, family and plan instead of silently starting over.
     """
-    import uuid as _uuid
     try:
-        uid = str(_uuid.UUID(str(claims["sub"])))
+        uid = str(uuid.UUID(str(claims["sub"])))
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid or expired sign-in. Please try again.")
     user = await db.fetchrow("select * from users where supabase_uid = $1", uid)

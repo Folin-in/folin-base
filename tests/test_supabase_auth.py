@@ -21,7 +21,7 @@ import httpx  # noqa: E402
 import jwt as pyjwt  # noqa: E402
 
 import config  # noqa: E402
-import database as db  # noqa: E402
+from db import session as db  # noqa: E402
 import rate_limit  # noqa: E402
 import security  # noqa: E402
 from server import app  # noqa: E402
