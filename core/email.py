@@ -81,7 +81,7 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
         return None
 
 
-# ---------- Password reset via SMTP (spec item #7) ----------
+# ---------- Password reset via SMTP () ----------
 def smtp_enabled() -> bool:
     return bool(settings.smtp_enabled)
 

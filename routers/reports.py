@@ -96,7 +96,7 @@ async def _do_analyze(req: AnalyzeRequest, user_id: str, current_user_snapshot: 
     except AnalysisRejected as e:
         raise HTTPException(status_code=422, detail=e.user_message)
     except UnsupportedDocument as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=e.user_message)
     except ModelUnavailable as e:
         logger.error("AI analysis failed: %s", e)
         raise HTTPException(status_code=502, detail=MSG_PROVIDER)
@@ -204,7 +204,7 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
         # rather than let it occupy the one-job-per-user slot and fail 20s later.
         if len(f.file_base64 or "") < 512:
             raise HTTPException(status_code=400, detail="That file looks empty or corrupted. Please pick the file again.")
-    # HARDENING-4: reject oversized payloads BEFORE decoding.
+    # reject oversized payloads BEFORE decoding.
     # Base64 inflates by ~4/3, so 10 MB decoded is ~14 MB encoded. Reject before decoding.
     if sum(len(f.file_base64) for f in files) > 14 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF.")
@@ -653,7 +653,7 @@ async def rename_report(
     return {"id": report_id, "title": new_title}
 
 
-# ---------- Spec item #4: user-editable biomarkers ----------
+# ---------- user-editable biomarkers ----------
 @router.patch("/{report_id}/biomarkers")
 async def edit_biomarker(
     report_id: str,
@@ -749,7 +749,7 @@ async def edit_biomarker(
         datetime.now(timezone.utc).isoformat(),
     )
     cache.invalidate_reports(current_user["user_id"])
-    fresh = await db.fetchrow("select * from reports where id = $1::uuid", report_id)
+    fresh = await db.fetchrow("select * from reports where id = $1::uuid and user_id = $2", report_id, current_user["user_id"])
     return Report.from_row(fresh).model_dump()
 
 

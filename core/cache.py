@@ -1,7 +1,7 @@
 """In-process TTL cache for the per-request user lookup (the hottest DB path).
 
 Every users-table write MUST call invalidate(user_id) - that keeps token revocation
-(SEC-003) and profile updates instant, while repeat reads within the TTL skip the
+and profile updates instant, while repeat reads within the TTL skip the
 remote Postgres round-trip.
 
 # ponytail: single-process dict cache; swap for Redis if the backend ever scales past one instance

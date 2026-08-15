@@ -62,6 +62,9 @@ class AnalysisRejected(Exception):
 
 class UnsupportedDocument(Exception):
     """Not a medical document. 400 - the analysis was done, so it still counts."""
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
 class InvalidUpload(Exception):

@@ -51,7 +51,7 @@ async def _member_summary(user_id: str) -> dict:
     }
 
 
-# NOTE: intentionally NO auto-accept-on-register hook - SEC-001/SEC-002 fix.
+# NOTE: intentionally NO auto-accept-on-register hook - /fix.
 # Invitees must explicitly accept a pending invite in-app.
 
 
@@ -73,7 +73,7 @@ async def invite_family(req: FamilyInviteRequest, current_user: dict = Depends(g
     if relationship not in RELATIONSHIPS:
         relationship = "family"
 
-    # HARDENING-3: per-user daily invite cap. Prevents email/cost abuse of the Resend account
+    # per-user daily invite cap. Prevents email/cost abuse of the Resend account
     # and reduces mass-phishing exposure via our domain. 20 successful sends per day.
     await check_and_increment_daily_quota(current_user["user_id"], plan="free", quota_bucket="family_invite_daily")
 
@@ -96,7 +96,7 @@ async def invite_family(req: FamilyInviteRequest, current_user: dict = Depends(g
 
     invite_id = uuid.uuid4().hex
     inviter_name = current_user.get("name") or current_user.get("username") or "Someone"
-    # SEC-002: bind to the invitee's user_id at invite time when the account already exists.
+    # bind to the invitee's user_id at invite time when the account already exists.
     # Accept-time will then require user_id match, so a later email change on a different
     # account cannot steal this invite.
     await db.execute(
@@ -146,7 +146,7 @@ async def cancel_invite(invite_id: str, current_user: dict = Depends(get_current
 @router.get("/incoming-invites")
 async def list_incoming_invites(current_user: dict = Depends(get_current_user)):
     """List pending invites addressed to the current user.
-    SEC-002: Only include invites whose `invitee_user_id` matches me OR that had no bound
+    Only include invites whose `invitee_user_id` matches me OR that had no bound
     user id at invite time AND whose email matches mine - this prevents someone who later
     changes their email to a targeted address from seeing invites meant for that address."""
     email = current_user["email"].lower().strip()
@@ -178,7 +178,7 @@ async def list_incoming_invites(current_user: dict = Depends(get_current_user)):
 
 @router.post("/incoming-invites/{invite_id}/accept")
 async def accept_incoming_invite(invite_id: str, current_user: dict = Depends(get_current_user)):
-    """SEC-002: When the invite was bound to a specific user_id at creation, require an exact
+    """When the invite was bound to a specific user_id at creation, require an exact
     match. Otherwise fall back to email match (invitee didn't exist at invite time)."""
     email = current_user["email"].lower().strip()
     my_id = current_user["user_id"]
@@ -211,7 +211,7 @@ async def accept_incoming_invite(invite_id: str, current_user: dict = Depends(ge
 
 @router.post("/incoming-invites/{invite_id}/decline")
 async def decline_incoming_invite(invite_id: str, current_user: dict = Depends(get_current_user)):
-    """SEC-002 mirror of accept: decline only if the invite belongs to me (by bound user_id or
+    """Mirror of accept: decline only if the invite belongs to me (by bound user_id or
     email fallback for legacy invites)."""
     email = current_user["email"].lower().strip()
     my_id = current_user["user_id"]

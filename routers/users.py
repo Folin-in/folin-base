@@ -13,6 +13,7 @@ from app.models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, ChangeE
                     ChangePasswordRequest, HealthProfileUpdate,
                     PlanChangeRequest, PreferencesUpdate, default_preferences, public_user)
 from app.enums import Plan
+from db.sql import USERS_UPDATABLE, set_clause
 from app.constants import VALID_APPEARANCE, VALID_NOTIFICATIONS, VALID_REGIONS, VALID_UNITS
 from core.security import (create_access_token, get_current_user, hash_password, issue_refresh_token,
                       revoke_all_refresh_tokens, verify_password)
@@ -115,8 +116,8 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
             await record_event_once(current_user["user_id"], "allergies_declared", now)
 
     if updates:
-        sets = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(updates))
-        # If email was changed, revoke all previously issued tokens (SEC-003), including
+        sets = set_clause(updates, USERS_UPDATABLE, "users")
+        # If email was changed, revoke all previously issued tokens (), including
         # refresh tokens so a "revoked" session can't re-mint access via refresh.
         if email_changed:
             sets += ", token_version = token_version + 1"
@@ -277,7 +278,7 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
     new_plan = (req.plan or "").strip().lower()
     if new_plan not in PLANS:
         raise HTTPException(status_code=400, detail=f"plan must be one of {sorted(PLANS)}")
-    # SEC-002: upgrades to paid tiers are only allowed when self-serve mode is enabled
+    # upgrades to paid tiers are only allowed when self-serve mode is enabled
     # (preview/demo). Production must set ALLOW_SELF_SERVE_PRO=false and grant plans
     # via a verified payment webhook. Downgrades are always allowed.
     if new_plan != "free" and not settings.allow_self_serve_pro:

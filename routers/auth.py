@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from core import cache
 from app.config import settings
+from db.sql import SOCIAL_ID_COLUMNS, USERS_UPDATABLE, assert_columns, set_clause
 from app.constants import RESET_CODE_TTL_MIN
 from db import session as db
 from core.email import send_password_reset, smtp_enabled
@@ -32,7 +33,7 @@ def _now() -> datetime:
 
 @router.post("/register")
 async def register(req: RegisterRequest, request: Request):
-    # SEC-004: block credential-spam
+    # block credential-spam
     check_ip_rate_limit(request, bucket="register", max_hits=10, window_seconds=600)
     if not req.consent:
         raise HTTPException(status_code=400, detail="Please confirm you're 18+ and consent to health-data processing to create an account.")
@@ -75,7 +76,7 @@ async def register(req: RegisterRequest, request: Request):
 
 @router.post("/login")
 async def login(req: LoginRequest, request: Request):
-    # SEC-004: brute-force guard - 15 attempts per 5 minutes per IP
+    # brute-force guard - 15 attempts per 5 minutes per IP
     check_ip_rate_limit(request, bucket="login", max_hits=15, window_seconds=300)
     identifier = req.identifier.lower().strip()
     user = await db.fetchrow("select * from users where email = $1 or username = $1", identifier)
@@ -139,7 +140,7 @@ async def me(current_user: dict = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(current_user: dict = Depends(get_current_user)):
-    """Revoke the current token: bump token_version (rejects outstanding JWTs, SEC-003)
+    """Revoke the current token: bump token_version (rejects outstanding JWTs)
     and revoke every refresh token so no new access tokens can be minted."""
     await db.execute("update users set token_version = token_version + 1 where user_id = $1", current_user["user_id"])
     cache.invalidate(current_user["user_id"])
@@ -175,7 +176,8 @@ async def _unique_username(base: str) -> str:
 
 async def _social_login(provider: str, provider_sub: str, email: str, name: str | None, picture: str | None):
     """Find-or-create a user for a verified social identity, link by email, return a token pair."""
-    id_col = f"{provider}_id"  # google_id | apple_id
+    id_col = f"{provider}_id"
+    assert_columns([id_col], SOCIAL_ID_COLUMNS, "users")
     # Two rows can match at once: the account that owns this provider sub, and a different
     # account that happens to hold the same email (e.g. the sub's owner changed their Folin
     # email and a stranger later registered with the freed address). The sub is the identity
@@ -198,7 +200,7 @@ async def _social_login(provider: str, provider_sub: str, email: str, name: str 
         if not user.get("name") and name:
             updates["name"] = name
         if updates:
-            sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(updates))
+            sets = set_clause(updates, USERS_UPDATABLE, "users")
             await db.execute(f"update users set {sets} where user_id = $1", user["user_id"], *updates.values())
             cache.invalidate(user["user_id"])
             user = await db.fetchrow("select * from users where user_id = $1", user["user_id"])
@@ -219,6 +221,7 @@ async def _social_login(provider: str, provider_sub: str, email: str, name: str 
             "created_at": _now().isoformat(),
         }
         cols = list(user.keys())
+        assert_columns([c for c in cols if c != "user_id"], USERS_UPDATABLE | {"auth_provider", "token_version", "created_at"}, "users")
         await db.execute(
             f"insert into users ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))})",
             *user.values(),
@@ -333,6 +336,7 @@ async def supabase_sync(req: SupabaseSyncRequest, request: Request):
                 "consent_version": settings.consent_version,
             }
             cols = list(new.keys())
+            assert_columns([c for c in cols if c != "user_id"], USERS_UPDATABLE | {"auth_provider", "token_version", "created_at"}, "users")
             await db.execute(
                 f"insert into users ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))})",
                 *new.values(),
@@ -360,7 +364,7 @@ async def apple_login(req: AppleLoginRequest, request: Request):
     return await _social_login("apple", claims["sub"], email, req.name, None)
 
 
-# ---------- Password reset (spec item #7) ----------
+# ---------- Password reset () ----------
 
 
 def _generate_reset_code() -> str:
@@ -424,7 +428,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
         raise HTTPException(status_code=400, detail="Invalid or expired code.")
     if not verify_password(req.code.strip(), entry.get("code_hash") or ""):
         raise HTTPException(status_code=400, detail="Invalid or expired code.")
-    # Update password + revoke every existing token (SEC-003), including refresh tokens -
+    # Update password + revoke every existing token (), including refresh tokens -
     # a stolen refresh token must not survive a password change.
     await db.execute(
         "update users set password_hash = $1, token_version = token_version + 1 where user_id = $2",

@@ -42,14 +42,14 @@ def _peer_is_trusted(peer: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    """HARDENING-1: only honor proxy headers when the direct peer is a trusted proxy.
+    """only honor proxy headers when the direct peer is a trusted proxy.
     Otherwise use the socket peer. Prevents X-Forwarded-For header rotation from defeating
     per-IP throttles on /auth/login and /auth/register."""
     peer = request.client.host if request.client else "unknown"
     if _peer_is_trusted(peer):
         fwd = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
         if fwd:
-            # P3 hardening: walk the chain RIGHT-to-LEFT skipping trusted proxies; the first
+            # walk the chain RIGHT-to-LEFT skipping trusted proxies; the first
             # untrusted hop is the real client. (Left-most is attacker-controllable padding.)
             hops = [h.strip() for h in fwd.split(",") if h.strip()]
             for hop in reversed(hops):

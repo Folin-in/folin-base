@@ -115,7 +115,7 @@ class PlanChangeRequest(BaseModel):
     plan: str = Field(min_length=1)
 
 
-# ---------- Member profiles (spec item #11) ----------
+# ---------- Member profiles () ----------
 MEMBER_RELATIONS = {"self", "partner", "parent", "child", "sibling", "family", "other"}
 
 
@@ -146,7 +146,7 @@ class Biomarker(BaseModel):
     category: str = "Other"
     explanation: str = ""
     tip: str = ""
-    # (spec item #4) Marks values the user corrected after AI OCR.
+    # () Marks values the user corrected after AI OCR.
     user_edited: bool = False
     # Accuracy features: set by sanity guardrails (free) or the Pro AI self-check.
     needs_verification: bool = False
@@ -190,7 +190,7 @@ REPORT_TYPES = {"lab", "opd", "prescription", "imaging", "discharge", "other"}
 
 class Report(BaseDocument):
     user_id: str = ""
-    # spec item #11: which member (sub-profile) this report belongs to. "self" for the user.
+    # which member (sub-profile) this report belongs to. "self" for the user.
     member_id: str = "self"
     filename: str = ""
     mime_type: str = ""
