@@ -17,14 +17,15 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import cache
-import config
+from core import cache
+from app.config import settings
 from db import session as db
-from security import get_current_user
+from core.security import get_current_user
+from app.enums import Plan
+from app.constants import RAZORPAY_API
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-RAZORPAY_API = "https://api.razorpay.com/v1"
 
 
 def _now() -> datetime:
@@ -32,7 +33,7 @@ def _now() -> datetime:
 
 
 def _auth_header() -> dict:
-    raw = f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()
+    raw = f"{settings.razorpay_key_id}:{settings.razorpay_key_secret}".encode()
     return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
 
 
@@ -51,10 +52,10 @@ class VerifyRequest(BaseModel):
 async def create_order(current_user: dict = Depends(get_current_user)):
     """Create a Razorpay order for the Pro pass. Amount is server-decided."""
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan == "pro":
+    if plan == Plan.PRO:
         raise HTTPException(status_code=400, detail="You're already on Pro.")
 
-    amount_inr = config.PRO_PRICE_INR
+    amount_inr = settings.pro_price_inr
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(
@@ -83,8 +84,8 @@ async def create_order(current_user: dict = Depends(get_current_user)):
         "order_id": order["id"],
         "amount": order["amount"],
         "currency": order["currency"],
-        "key_id": config.RAZORPAY_KEY_ID,
-        "term_days": config.PRO_TERM_DAYS,
+        "key_id": settings.razorpay_key_id,
+        "term_days": settings.pro_term_days,
         "amount_inr": amount_inr,
     }
 
@@ -100,7 +101,7 @@ async def verify_payment(req: VerifyRequest, current_user: dict = Depends(get_cu
         # Someone else's order - do not confirm or deny which, just refuse.
         raise HTTPException(status_code=404, detail="Unknown order.")
 
-    expected = expected_signature(req.razorpay_order_id, req.razorpay_payment_id, config.RAZORPAY_KEY_SECRET)
+    expected = expected_signature(req.razorpay_order_id, req.razorpay_payment_id, settings.razorpay_key_secret)
     if not hmac.compare_digest(expected, req.razorpay_signature):
         await db.execute("update payments set status = 'failed' where order_id = $1", req.razorpay_order_id)
         raise HTTPException(status_code=400, detail="Payment could not be verified. You have not been charged.")
@@ -109,7 +110,7 @@ async def verify_payment(req: VerifyRequest, current_user: dict = Depends(get_cu
         return {"ok": True, "already_applied": True, "preferences": current_user.get("preferences") or {}}
 
     now = _now()
-    expires_at = (now + timedelta(days=config.PRO_TERM_DAYS)).isoformat()
+    expires_at = (now + timedelta(days=settings.pro_term_days)).isoformat()
     # The unique index on razorpay_payment_id is what actually stops a replay across orders:
     # reusing one captured payment on a second order trips the constraint here.
     try:

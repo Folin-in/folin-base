@@ -10,8 +10,10 @@ from typing import Deque, Dict, Tuple
 
 from fastapi import HTTPException, Request
 
-import config
+from app.config import settings
 from db import session as db
+from app.enums import Plan
+from app.constants import DAILY_QUOTA_FREE_GENERIC, DAILY_QUOTA_OVERRIDES
 
 
 # ---------- In-memory per-IP sliding window ----------
@@ -27,7 +29,7 @@ def _peer_is_trusted(peer: str) -> bool:
         peer_addr = ip_address(peer)
     except ValueError:
         return False
-    for entry in config.TRUSTED_PROXY_IPS:
+    for entry in settings.trusted_proxy_ips:
         try:
             if "/" in entry:
                 if peer_addr in ip_network(entry, strict=False):
@@ -79,14 +81,9 @@ def check_ip_rate_limit(request: Request, bucket: str, max_hits: int, window_sec
 
 # ---------- Postgres-backed daily quota per user ----------
 # Analyze quota for FREE users is a lifetime total checked in reports.py, not here.
-DAILY_QUOTA_FREE = 20  # generic default for non-analyze buckets without an override
-DAILY_QUOTA_PRO = config.PRO_DAILY_ANALYSES
+DAILY_QUOTA_PRO = settings.pro_daily_analyses
 
 # Named per-bucket overrides. Buckets that don't appear here use the plan defaults above.
-DAILY_QUOTA_OVERRIDES = {
-    "family_invite_daily": 20,  # HARDENING-3: cap invite emails/user/day
-    "password_reset_email": 3,  # spec item #7: 3 forgot-password sends/day/user
-}
 
 
 def _today_key() -> str:
@@ -97,7 +94,7 @@ async def check_and_increment_daily_quota(user_id: str, plan: str, quota_bucket:
     """Atomically increment a per-user daily counter and reject if it exceeds the plan quota."""
     limit = DAILY_QUOTA_OVERRIDES.get(quota_bucket)
     if limit is None:
-        limit = DAILY_QUOTA_PRO if plan == "pro" else DAILY_QUOTA_FREE
+        limit = DAILY_QUOTA_PRO if plan == Plan.PRO else DAILY_QUOTA_FREE_GENERIC
     day_key = _today_key()
     doc_id = f"{quota_bucket}:{user_id}:{day_key}"
 

@@ -9,8 +9,8 @@ import bcrypt
 import jwt
 from fastapi import HTTPException, Request
 
-import cache
-import config
+from core import cache
+from app.config import settings
 from db import session as db
 
 logger = logging.getLogger(__name__)
@@ -36,14 +36,14 @@ def create_access_token(user_id: str, token_version: int = 0) -> str:
         "type": "access",
         "tv": int(token_version),  # bumped on logout / password change to revoke old tokens
         "iat": now,
-        "exp": now + timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES),
+        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
     }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        return jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
     except jwt.PyJWTError:
         return None
 
@@ -65,7 +65,7 @@ async def issue_refresh_token(user_id: str, family_id: Optional[str] = None) -> 
         """insert into refresh_tokens (token_hash, user_id, family_id, used, revoked_at, created_at, expires_at)
            values ($1, $2, $3, false, null, $4, $5)""",
         hash_refresh(raw), user_id, family_id or secrets.token_hex(16),
-        now, now + timedelta(days=config.REFRESH_TOKEN_DAYS),
+        now, now + timedelta(days=settings.refresh_token_days),
     )
     return raw
 
@@ -110,8 +110,8 @@ async def _expire_pro_if_due(user: dict) -> dict:
 # Supabase signs its access tokens with a rotating asymmetric key (ES256) published at
 # the project's JWKS endpoint, so verification needs no shared secret. PyJWKClient caches
 # the fetched keys, so this costs one HTTPS call per process.
-_SUPABASE_JWKS = jwt.PyJWKClient(f"{config.SUPABASE_URL}/auth/v1/.well-known/jwks.json") \
-    if config.SUPABASE_URL else None
+_SUPABASE_JWKS = jwt.PyJWKClient(f"{settings.supabase_url}/auth/v1/.well-known/jwks.json") \
+    if settings.supabase_url else None
 
 
 def decode_supabase_token(token: str) -> Optional[dict]:
@@ -122,7 +122,7 @@ def decode_supabase_token(token: str) -> Optional[dict]:
         key = _SUPABASE_JWKS.get_signing_key_from_jwt(token).key
         claims = jwt.decode(
             token, key, algorithms=["ES256", "RS256"], audience="authenticated",
-            issuer=f"{config.SUPABASE_URL}/auth/v1",
+            issuer=f"{settings.supabase_url}/auth/v1",
         )
     except Exception:
         return None

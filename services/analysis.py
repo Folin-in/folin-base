@@ -18,8 +18,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import cache
-import storage
+from core import cache
+from core import storage
 from agents import DocumentRejected, ExtractorAgent, OutputAuditor, ScreenerAgent, VerifierAgent
 from agents.base import BadModelReply, ModelUnavailable
 from agents.registry import get as get_spec
@@ -27,9 +27,9 @@ from agents.tools import TOOLS
 from app.constants import ALLOWED_MIME, LEGACY_CATEGORY_MAP, SUGGESTION_CATEGORIES
 from app.enums import BiomarkerStatus, Language, Plan, ReportType
 from db import session as db
-from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score, compute_profile,
+from services.gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score, compute_profile,
                           effective_date, sort_by_effective_date)
-from models import AnalyzeFileIn, Biomarker, Medication, Report, Suggestion
+from app.models import AnalyzeFileIn, Biomarker, Medication, Report, Suggestion
 from services.engagement import fetch_events
 from services.members import member_id_of, resolve_member_profile
 

@@ -4,14 +4,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-import cache
+from core import cache
 from db import session as db
-from email_service import send_family_invite
-from gamification import compute_profile
-from models import FamilyInviteRequest, RELATIONSHIPS
-from rate_limit import check_and_increment_daily_quota
-from routers.users import fetch_events
-from security import get_current_user
+from core.email import send_family_invite
+from services.gamification import compute_profile
+from app.models import FamilyInviteRequest, RELATIONSHIPS
+from core.rate_limit import check_and_increment_daily_quota
+from services.engagement import fetch_events
+from core.security import get_current_user
+from app.enums import Plan
 
 router = APIRouter(prefix="/family", tags=["family"])
 
@@ -63,7 +64,7 @@ async def invite_family(req: FamilyInviteRequest, current_user: dict = Depends(g
     # PRO feature: sending invites requires Pro. Accepting a Pro user's invite stays free,
     # otherwise invites would only ever connect Pro users to Pro users.
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan != "pro":
+    if plan != Plan.PRO:
         raise HTTPException(status_code=403, detail="Inviting family members is a Pro feature. Upgrade to unlock.")
     invitee_email = req.email.lower().strip()
     if invitee_email == current_user["email"].lower():

@@ -9,7 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
-import config
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +22,11 @@ except Exception:
 
 
 def _resend_configured() -> bool:
-    return _RESEND_AVAILABLE and bool(config.RESEND_API_KEY)
+    return _RESEND_AVAILABLE and bool(settings.resend_api_key)
 
 
 if _resend_configured():
-    resend.api_key = config.RESEND_API_KEY  # type: ignore
+    resend.api_key = settings.resend_api_key  # type: ignore
 
 
 def send_family_invite(inviter_name: str, invitee_email: str, relationship: str = "family") -> Optional[str]:
@@ -34,7 +34,7 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
         logger.info(f"[email] RESEND_API_KEY missing - skipping invite email to {invitee_email}")
         return None
 
-    invite_link = config.APP_INVITE_URL
+    invite_link = settings.app_invite_url
     safe_name = _html.escape((inviter_name or "Someone").strip()[:80], quote=True) or "Someone"
     safe_email = _html.escape((invitee_email or "").strip()[:254], quote=True)
     safe_rel = _html.escape((relationship or "family").capitalize()[:20], quote=True)
@@ -68,7 +68,7 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
     """
     try:
         resp = resend.Emails.send({  # type: ignore
-            "from": config.RESEND_FROM,
+            "from": settings.resend_from,
             "to": [invitee_email],
             "subject": subject,
             "html": html,
@@ -83,7 +83,7 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
 
 # ---------- Password reset via SMTP (spec item #7) ----------
 def smtp_enabled() -> bool:
-    return bool(config.SMTP_ENABLED)
+    return bool(settings.smtp_enabled)
 
 
 def send_password_reset(to_email: str, code: str) -> bool:
@@ -115,20 +115,20 @@ def send_password_reset(to_email: str, code: str) -> bool:
     """
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = config.SMTP_FROM
+    msg["From"] = settings.smtp_from
     msg["To"] = to_email
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
     try:
-        with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=15) as s:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as s:
             s.ehlo()
             try:
                 s.starttls()
                 s.ehlo()
             except Exception:
                 pass
-            s.login(config.SMTP_USER, config.SMTP_PASS)
-            s.sendmail(config.SMTP_FROM, [to_email], msg.as_string())
+            s.login(settings.smtp_user, settings.smtp_pass)
+            s.sendmail(settings.smtp_from, [to_email], msg.as_string())
         logger.info(f"[email] Sent reset code to {to_email}")
         return True
     except Exception as e:

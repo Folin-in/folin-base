@@ -18,11 +18,11 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 import httpx  # noqa: E402
 
-import config  # noqa: E402
-import rate_limit  # noqa: E402
+from app.config import settings  # noqa: E402
+from core import rate_limit  # noqa: E402
 from db import session as db  # noqa: E402
 from routers.payments import expected_signature  # noqa: E402
-from server import app  # noqa: E402
+from app.main import app  # noqa: E402
 
 # One loop for the whole run, owned by conftest - see its docstring.
 _LOOP = asyncio.get_event_loop()
@@ -66,12 +66,12 @@ async def seed_order(user_id, order_id, amount=None, status="created"):
     await db.execute(
         """insert into payments (order_id, user_id, amount_inr, currency, status, created_at)
            values ($1, $2, $3, 'INR', $4, '2026-08-08T00:00:00+00:00')""",
-        order_id, user_id, amount if amount is not None else config.PRO_PRICE_INR, status,
+        order_id, user_id, amount if amount is not None else settings.pro_price_inr, status,
     )
 
 
 def sign(order_id, payment_id, secret=None):
-    secret = secret or config.RAZORPAY_KEY_SECRET
+    secret = secret or settings.razorpay_key_secret
     return hmac.new(secret.encode(), f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
 
 
@@ -137,7 +137,7 @@ def test_valid_signature_activates_pro():
         assert me["preferences"]["plan_expires_at"]
 
         hist = (await c.get("/api/user/plan/history", headers=h)).json()
-        assert hist[0]["plan"] == "pro" and hist[0]["amount_inr"] == config.PRO_PRICE_INR
+        assert hist[0]["plan"] == "pro" and hist[0]["amount_inr"] == settings.pro_price_inr
         await db.execute("delete from users where email = $1", email)
 
     run(t)
@@ -237,14 +237,14 @@ def test_order_uses_server_price_and_is_live():
         r = await c.post("/api/payments/razorpay/order", headers=h)
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["amount"] == config.PRO_PRICE_INR * 100
+        assert body["amount"] == settings.pro_price_inr * 100
         assert body["currency"] == "INR"
-        assert body["key_id"] == config.RAZORPAY_KEY_ID
+        assert body["key_id"] == settings.razorpay_key_id
         assert body["key_id"].startswith("rzp_test_"), "not a test key"
         assert "secret" not in str(body).lower()
 
         row = await db.fetchrow("select * from payments where order_id = $1", body["order_id"])
-        assert row["amount_inr"] == config.PRO_PRICE_INR and row["status"] == "created"
+        assert row["amount_inr"] == settings.pro_price_inr and row["status"] == "created"
         await db.execute("delete from users where email = $1", email)
 
     run(t)

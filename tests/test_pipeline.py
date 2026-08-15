@@ -13,7 +13,7 @@ import services.analysis as A
 from agents.base import BadModelReply, ModelUnavailable
 from app.enums import ReportType
 from db import session as db
-from models import AnalyzeFileIn
+from app.models import AnalyzeFileIn
 
 _LOOP = asyncio.get_event_loop()
 _ready = False

@@ -3,23 +3,22 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-import cache
-import config
+from core import cache
+from app.config import settings
 from db import session as db
-import storage
-from gamification import EVENT_XP, compute_profile, sort_by_effective_date
-from models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, ChangeEmailRequest,
+from core import storage
+from services.engagement import fetch_events, record_event_once
+from services.gamification import EVENT_XP, compute_profile, sort_by_effective_date
+from app.models import (DIETS, GENDERS, LANGUAGES, PLANS, WORKOUT_TYPES, ChangeEmailRequest,
                     ChangePasswordRequest, HealthProfileUpdate,
                     PlanChangeRequest, PreferencesUpdate, default_preferences, public_user)
-from security import (create_access_token, get_current_user, hash_password, issue_refresh_token,
+from app.enums import Plan
+from app.constants import VALID_APPEARANCE, VALID_NOTIFICATIONS, VALID_REGIONS, VALID_UNITS
+from core.security import (create_access_token, get_current_user, hash_password, issue_refresh_token,
                       revoke_all_refresh_tokens, verify_password)
 
 router = APIRouter(tags=["users"])
 
-VALID_APPEARANCE = {"light", "dark", "system"}
-VALID_NOTIFICATIONS = {"off", "weekly", "daily"}
-VALID_UNITS = {"us", "si"}
-VALID_REGIONS = {"india", "other"}
 
 
 @router.put("/user/health-profile")
@@ -111,9 +110,9 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
         # Auto-events (once each, enforced here AND at scoring time): completing the
         # profile / declaring allergies is behaviour the gamification engine rewards.
         if all(hp_new.get(k) for k in ("age", "weight_kg", "height_cm", "diet")) and hp_new.get("workout") is not None:
-            await _record_event_once(current_user["user_id"], "profile_completed", now)
+            await record_event_once(current_user["user_id"], "profile_completed", now)
         if hp_new.get("allergies"):
-            await _record_event_once(current_user["user_id"], "allergies_declared", now)
+            await record_event_once(current_user["user_id"], "allergies_declared", now)
 
     if updates:
         sets = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(updates))
@@ -129,21 +128,6 @@ async def update_health_profile(req: HealthProfileUpdate, current_user: dict = D
     return public_user(user)
 
 
-async def _record_event_once(user_id: str, etype: str, at: str) -> None:
-    """Insert a once-only engagement event unless one already exists."""
-    exists = await db.fetchval(
-        "select 1 from engagement_events where user_id = $1 and type = $2 limit 1", user_id, etype
-    )
-    if not exists:
-        await db.execute(
-            "insert into engagement_events (user_id, type, at) values ($1, $2, $3)", user_id, etype, at
-        )
-
-
-async def fetch_events(user_id: str) -> list[dict]:
-    return await db.fetch(
-        "select type, report_id, ref, at from engagement_events where user_id = $1", user_id
-    )
 
 
 @router.post("/user/events")
@@ -181,7 +165,7 @@ async def get_gamification_profile(
 async def give_consent(current_user: dict = Depends(get_current_user)):
     await db.execute(
         "update users set consented_at = $1, consent_version = $2 where user_id = $3",
-        datetime.now(timezone.utc).isoformat(), config.CONSENT_VERSION, current_user["user_id"],
+        datetime.now(timezone.utc).isoformat(), settings.consent_version, current_user["user_id"],
     )
     cache.invalidate(current_user["user_id"])
     user = await db.fetchrow("select * from users where user_id = $1", current_user["user_id"])
@@ -286,7 +270,7 @@ async def change_email(req: ChangeEmailRequest, current_user: dict = Depends(get
 # ---------- Plan (free / pro) ----------
 @router.post("/user/plan")
 async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_current_user)):
-    """Switch the user's plan. Pro runs config.PRO_TERM_DAYS days, then auto-expires (checked on every
+    """Switch the user's plan. Pro runs settings.pro_term_days days, then auto-expires (checked on every
     request in get_current_user) - the user re-purchases after that. Every change lands in
     plan_history. NOTE: self-serve until Stripe; ALLOW_SELF_SERVE_PRO=false blocks upgrades.
     """
@@ -296,11 +280,11 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
     # SEC-002: upgrades to paid tiers are only allowed when self-serve mode is enabled
     # (preview/demo). Production must set ALLOW_SELF_SERVE_PRO=false and grant plans
     # via a verified payment webhook. Downgrades are always allowed.
-    if new_plan != "free" and not config.ALLOW_SELF_SERVE_PRO:
+    if new_plan != "free" and not settings.allow_self_serve_pro:
         raise HTTPException(status_code=403, detail="Upgrades require payment. Please use the checkout flow.")
 
     now = datetime.now(timezone.utc)
-    expires_at = (now + timedelta(days=config.PRO_TERM_DAYS)).isoformat() if new_plan == "pro" else None
+    expires_at = (now + timedelta(days=settings.pro_term_days)).isoformat() if new_plan == "pro" else None
     merged = {
         **(current_user.get("preferences") or {}),
         "plan": new_plan,
@@ -314,7 +298,7 @@ async def change_plan(req: PlanChangeRequest, current_user: dict = Depends(get_c
         current_user["user_id"],
         "upgraded" if new_plan == "pro" else "downgraded",
         new_plan,
-        config.PRO_PRICE_INR if new_plan == "pro" else None,
+        settings.pro_price_inr if new_plan == "pro" else None,
         now.isoformat(),
         expires_at,
     )
@@ -336,7 +320,7 @@ async def plan_history(current_user: dict = Depends(get_current_user)):
 async def export_user_data(current_user: dict = Depends(get_current_user)):
     """Return the full user data blob for download - profile + all reports. PRO feature."""
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan != "pro":
+    if plan != Plan.PRO:
         raise HTTPException(status_code=403, detail="Exporting your data is a Pro feature. Upgrade to unlock.")
     user_id = current_user["user_id"]
     reports = await db.fetch("select * from reports where user_id = $1 and deleted_at is null order by uploaded_at desc limit 1000", user_id)

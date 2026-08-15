@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-import cache
+from core import cache
 from db import session as db
-from models import GENDERS, MEMBER_RELATIONS, MemberUpsertRequest
-from security import get_current_user
+from app.models import GENDERS, MEMBER_RELATIONS, MemberUpsertRequest
+from core.security import get_current_user
+from app.enums import Plan
 
 router = APIRouter(prefix="/members", tags=["members"])
 
@@ -65,7 +66,7 @@ async def list_members(current_user: dict = Depends(get_current_user)):
 async def create_member(req: MemberUpsertRequest, current_user: dict = Depends(get_current_user)):
     # PRO feature: family-member sub-profiles. Existing members keep working on free.
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan != "pro":
+    if plan != Plan.PRO:
         raise HTTPException(status_code=403, detail="Family member profiles are a Pro feature. Upgrade to unlock.")
     if req.gender is not None and req.gender not in GENDERS:
         raise HTTPException(status_code=400, detail="gender must be 'male' or 'female'")

@@ -10,14 +10,15 @@ import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-import cache
-import config
+from core import cache
+from app.config import settings
+from app.constants import RESET_CODE_TTL_MIN
 from db import session as db
-from email_service import send_password_reset, smtp_enabled
-from models import (ForgotPasswordRequest, LoginRequest, RegisterRequest,
+from core.email import send_password_reset, smtp_enabled
+from app.models import (ForgotPasswordRequest, LoginRequest, RegisterRequest,
                     ResetPasswordRequest, default_preferences, public_user)
-from rate_limit import check_and_increment_daily_quota, check_ip_rate_limit
-from security import (create_access_token, decode_supabase_token, get_current_user, hash_password, hash_refresh,
+from core.rate_limit import check_and_increment_daily_quota, check_ip_rate_limit
+from core.security import (create_access_token, decode_supabase_token, get_current_user, hash_password, hash_refresh,
                       issue_refresh_token, revoke_all_refresh_tokens, revoke_refresh_family,
                       verify_password)
 
@@ -55,7 +56,7 @@ async def register(req: RegisterRequest, request: Request):
         "token_version": 0,
         "created_at": _now().isoformat(),
         "consented_at": _now().isoformat(),
-        "consent_version": config.CONSENT_VERSION,
+        "consent_version": settings.consent_version,
     }
     await db.execute(
         """insert into users (user_id, email, username, name, password_hash, auth_provider,
@@ -231,12 +232,12 @@ async def _social_login(provider: str, provider_sub: str, email: str, name: str 
 @router.post("/google")
 async def google_login(req: GoogleLoginRequest, request: Request):
     """Verify a Google ID token (signature via Google JWKS, aud ∈ configured client IDs)."""
-    if not config.GOOGLE_CLIENT_IDS:
+    if not settings.google_client_ids:
         raise HTTPException(status_code=503, detail="Google login is not configured.")
     check_ip_rate_limit(request, bucket="social_login", max_hits=20, window_seconds=300)
     try:
         key = _GOOGLE_JWKS.get_signing_key_from_jwt(req.id_token).key
-        claims = pyjwt.decode(req.id_token, key, algorithms=["RS256"], audience=config.GOOGLE_CLIENT_IDS)
+        claims = pyjwt.decode(req.id_token, key, algorithms=["RS256"], audience=settings.google_client_ids)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid Google token. Please try again.")
     if claims.get("iss") not in ("https://accounts.google.com", "accounts.google.com"):
@@ -268,7 +269,7 @@ async def supabase_sync(req: SupabaseSyncRequest, request: Request):
     The client keeps using its Supabase access token afterwards; get_current_user accepts
     both issuers, so no Folin-issued token is minted here.
     """
-    if not config.SUPABASE_URL:
+    if not settings.supabase_url:
         raise HTTPException(status_code=503, detail="Supabase login is not configured.")
     check_ip_rate_limit(request, bucket="social_login", max_hits=20, window_seconds=300)
 
@@ -329,7 +330,7 @@ async def supabase_sync(req: SupabaseSyncRequest, request: Request):
                 "token_version": 0,
                 "created_at": now.isoformat(),
                 "consented_at": now.isoformat(),
-                "consent_version": config.CONSENT_VERSION,
+                "consent_version": settings.consent_version,
             }
             cols = list(new.keys())
             await db.execute(
@@ -349,7 +350,7 @@ async def apple_login(req: AppleLoginRequest, request: Request):
         key = _APPLE_JWKS.get_signing_key_from_jwt(req.identity_token).key
         claims = pyjwt.decode(
             req.identity_token, key, algorithms=["RS256"],
-            audience=config.APPLE_BUNDLE_ID, issuer="https://appleid.apple.com",
+            audience=settings.apple_bundle_id, issuer="https://appleid.apple.com",
         )
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid Apple token. Please try again.")
@@ -360,7 +361,6 @@ async def apple_login(req: AppleLoginRequest, request: Request):
 
 
 # ---------- Password reset (spec item #7) ----------
-RESET_CODE_TTL_MIN = 15
 
 
 def _generate_reset_code() -> str:

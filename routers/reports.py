@@ -14,24 +14,27 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import cache
-import config
+from core import cache
+from app.config import settings
 from db import session as db
-import storage
+from core import storage
 from agents import AdviceRefresher, TipsReconciler
 from agents.base import ModelUnavailable
 from services.analysis import (MSG_PROVIDER, AnalysisRejected, InvalidUpload, UnsupportedDocument,
                                pipeline)
 from agents.tools import TOOLS
-from gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
+from services.gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score,
                           compute_profile, effective_date, sort_by_effective_date)
-from models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, BiomarkerPatch,
+from app.models import (REPORT_TYPES, AnalyzeFileIn, AnalyzeRequest, Biomarker, BiomarkerPatch,
                     Medication, Report, ReportFeedbackIn, ReportTitleUpdate, Suggestion)
-from rate_limit import check_and_increment_daily_quota, refund_daily_quota
+from core.rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from services.engagement import fetch_events
 from services.members import member_id_of as _member_id_of, resolve_member_profile
 from agents.tools.sanity_bounds import parse_range as _parse_ref_bounds
-from security import get_current_user
+from core.security import get_current_user
+from app.enums import Plan
+from app.constants import (ALLOWED_MIME, ANALYZE_JOB_TIMEOUT_SECS, FEEDBACK_ISSUES, LEGACY_CATEGORY_MAP,
+                           MAX_ANALYZE_FILES, RETEST_AFTER_DAYS, SCORING_TYPES, SEVERITY, SUGGESTION_CATEGORIES)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -41,12 +44,7 @@ _profile_context = TOOLS["profile_context"]
 _names_match = TOOLS["name_match"]
 _sanity_note = TOOLS["sanity_bounds"]
 
-ALLOWED_MIME = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-SUGGESTION_CATEGORIES = {"nutrition", "movement", "sleep", "supplements", "lifestyle"}
-LEGACY_CATEGORY_MAP = {"diet": "nutrition", "exercise": "movement"}
 # Analysis jobs die after this many seconds so errors can't hang forever.
-ANALYZE_JOB_TIMEOUT_SECS = 180
-MAX_ANALYZE_FILES = 5
 
 
 def _req_files(req: AnalyzeRequest) -> list[AnalyzeFileIn]:
@@ -245,17 +243,17 @@ async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_c
 
     # Quotas: free = FREE_TOTAL_ANALYSES total (a trial, not per-day); Pro = daily cap.
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan == "pro":
+    if plan == Plan.PRO:
         await check_and_increment_daily_quota(current_user["user_id"], plan)
     else:
         used = await db.fetchval(
             "select count(*) from analyze_jobs where user_id = $1 and status = 'success'",
             current_user["user_id"],
         )
-        if used >= config.FREE_TOTAL_ANALYSES:
+        if used >= settings.free_total_analyses:
             raise HTTPException(
                 status_code=403,
-                detail=f"You've used your {config.FREE_TOTAL_ANALYSES} free analyses. Upgrade to Pro for {config.PRO_DAILY_ANALYSES} every day.",
+                detail=f"You've used your {settings.free_total_analyses} free analyses. Upgrade to Pro for {settings.pro_daily_analyses} every day.",
             )
 
     job_id = uuid.uuid4().hex[:16]
@@ -416,7 +414,6 @@ async def list_all_suggestions(
     return {"reports": reports_meta, "suggestions": out}
 
 
-RETEST_AFTER_DAYS = 90
 
 
 @router.get("/retest-reminders")
@@ -427,7 +424,7 @@ async def retest_reminders(
     """PRO feature: markers that were out-of-range in the latest lab report and are due
     for a retest (report older than RETEST_AFTER_DAYS). Free plan → 403 upsell."""
     plan = (current_user.get("preferences") or {}).get("plan") or "free"
-    if plan != "pro":
+    if plan != Plan.PRO:
         raise HTTPException(status_code=403, detail="Retest reminders are a Pro feature. Upgrade to unlock.")
     docs = sort_by_effective_date(
         await _member_reports(current_user["user_id"], member_id, lab_only=True), reverse=True
@@ -465,10 +462,8 @@ def _default_report_title(report_type: str | None) -> str:
     }.get(report_type or "lab", "Medical document")
 
 
-SEVERITY = {"normal": 0, "borderline_high": 1, "borderline_low": 1, "high": 2, "low": 2}
 # Reports whose score reflects measured biology. A prescription photo scores 65 by
 # heuristic; letting it set "your health score" made the number drop for no reason.
-SCORING_TYPES = {"lab"}
 
 
 def _to_float(v):
@@ -759,7 +754,6 @@ async def edit_biomarker(
 
 
 # ---------- Accuracy feedback: "Is this analysis correct?" ----------
-FEEDBACK_ISSUES = {"wrong_value", "missed_marker", "wrong_status", "bad_tip", "wrong_language", "other"}
 
 
 @router.post("/{report_id}/feedback")

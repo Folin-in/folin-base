@@ -6,7 +6,7 @@ import logging
 
 import httpx
 
-import config
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +14,13 @@ BUCKET = "reports"
 
 
 def _configured() -> bool:
-    return bool(config.SUPABASE_URL and config.SUPABASE_SERVICE_KEY)
+    return bool(settings.supabase_url and settings.supabase_service_key)
 
 
 def _headers() -> dict:
     return {
-        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
-        "apikey": config.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {settings.supabase_service_key}",
+        "apikey": settings.supabase_service_key,
     }
 
 
@@ -28,12 +28,12 @@ async def upload_report_file(path: str, raw: bytes, mime_type: str) -> bool:
     """Upload to <bucket>/<path>. Creates the private bucket on first use."""
     if not _configured():
         return False
-    url = f"{config.SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}"
+    url = f"{settings.supabase_url}/storage/v1/object/{BUCKET}/{path}"
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(url, content=raw, headers={**_headers(), "Content-Type": mime_type})
         if resp.status_code in (400, 404) and "Bucket not found" in resp.text:
             await client.post(
-                f"{config.SUPABASE_URL}/storage/v1/bucket",
+                f"{settings.supabase_url}/storage/v1/bucket",
                 json={"id": BUCKET, "name": BUCKET, "public": False, "file_size_limit": 10 * 1024 * 1024},
                 headers=_headers(),
             )
@@ -51,13 +51,13 @@ async def signed_url(path: str, expires_in: int = 3600) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                f"{config.SUPABASE_URL}/storage/v1/object/sign/{BUCKET}/{path}",
+                f"{settings.supabase_url}/storage/v1/object/sign/{BUCKET}/{path}",
                 json={"expiresIn": expires_in},
                 headers=_headers(),
             )
         if resp.status_code != 200:
             return None
-        return f"{config.SUPABASE_URL}/storage/v1{resp.json()['signedURL']}"
+        return f"{settings.supabase_url}/storage/v1{resp.json()['signedURL']}"
     except httpx.HTTPError:
         return None
 
@@ -70,7 +70,7 @@ async def delete_files(paths: list[str]) -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:
             await client.request(
                 "DELETE",
-                f"{config.SUPABASE_URL}/storage/v1/object/{BUCKET}",
+                f"{settings.supabase_url}/storage/v1/object/{BUCKET}",
                 json={"prefixes": paths},
                 headers=_headers(),
             )
