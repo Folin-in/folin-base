@@ -9,10 +9,8 @@ router, quota refunded), UnsupportedDocument for a non-medical file (400, still 
 and lets provider faults propagate (502, refunded).
 """
 import base64
-import hashlib
 import logging
 import os
-import re
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -24,12 +22,13 @@ from agents import DocumentRejected, ExtractorAgent, OutputAuditor, ScreenerAgen
 from agents.base import BadModelReply, ModelUnavailable
 from agents.registry import get as get_spec
 from agents.tools import TOOLS
-from app.constants import ALLOWED_MIME, LEGACY_CATEGORY_MAP, SUGGESTION_CATEGORIES
+from app.constants import ALLOWED_MIME
 from app.enums import BiomarkerStatus, Language, Plan, ReportType
 from db import session as db
-from services.gamification import (STATUS_WEIGHT, compute_document_score, compute_health_score, compute_profile,
-                          effective_date, sort_by_effective_date)
-from app.models import AnalyzeFileIn, Biomarker, Medication, Report, Suggestion
+from services.gamification import STATUS_WEIGHT, compute_profile, effective_date, sort_by_effective_date
+from app.models import AnalyzeFileIn, Biomarker, Report
+from services.analysis_types import AnalysisRejected, AnalysisResult, InvalidUpload, UnsupportedDocument
+from services.report_mapper import build_report, display_name
 from services.engagement import fetch_events
 from services.members import member_id_of, resolve_member_profile
 
@@ -41,8 +40,6 @@ BMI_BANDS = ((17.0, BiomarkerStatus.LOW), (18.5, BiomarkerStatus.BORDERLINE_LOW)
 BMI_REF_RANGE = "18.5 - 24.9"
 BMI_UNIT = "kg/m²"
 VERIFY_NOTE_MAX = 300
-_SCORE_IN_SUMMARY = re.compile(r"\s*\(?\b\d{1,3}\s*/\s*100\b\)?")
-_ATTENTION = {BiomarkerStatus.HIGH, BiomarkerStatus.LOW}
 
 MSG_INVALID_FILE = "Invalid file data."
 MSG_TOO_LARGE = "Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF."
@@ -51,36 +48,6 @@ MSG_UNREADABLE = "The AI couldn't read this report. Please try again or use a cl
 MSG_PROVIDER = "AI analysis failed. Please try again in a moment."
 MSG_PAGES_MIXED = "These photos don't look like pages of the same report. "
 MSG_PAGES_HOW = "Upload one report at a time, with all of its pages together."
-
-
-class AnalysisRejected(Exception):
-    """The user's file is the problem (mixed pages, injection, disguise). 422, refund."""
-    def __init__(self, user_message: str, reason: str = "", evidence: str = ""):
-        super().__init__(reason or user_message)
-        self.user_message, self.reason, self.evidence = user_message, reason, evidence
-
-
-class UnsupportedDocument(Exception):
-    """Not a medical document. 400 - the analysis was done, so it still counts."""
-    def __init__(self, user_message: str):
-        super().__init__(user_message)
-        self.user_message = user_message
-
-
-class InvalidUpload(Exception):
-    """Bad or oversized bytes. `status` is the HTTP code the router should use."""
-    def __init__(self, user_message: str, status: int = 400):
-        super().__init__(user_message)
-        self.user_message, self.status = user_message, status
-
-
-@dataclass
-class AnalysisResult:
-    report_id: str
-    report: dict
-    xp_earned: int
-    new_badges: list[dict]
-    profile: dict
 
 
 @dataclass
@@ -270,63 +237,9 @@ class AnalysisPipeline:
                                        + (f" (Document shows: {expected})" if expected else ""))[:VERIFY_NOTE_MAX]
 
     def _assemble(self, r: _Run) -> Report:
-        p = r.parsed
-        suggestions = []
-        for s in p.get("suggestions", []) or []:
-            try:
-                linked = s.get("linked_marker")
-                suggestions.append(Suggestion(
-                    title=str(s.get("title", "")).strip(), body=str(s.get("body", "")).strip(),
-                    category=self._normalize_category(s.get("category")),
-                    linked_marker=str(linked).strip() if linked else None))
-            except Exception:
-                continue
-        medications = []
-        for m in p.get("medications") or []:
-            try:
-                name = str(m.get("name") or "").strip()
-                if name:
-                    medications.append(Medication(
-                        name=name,
-                        dose=str(m["dose"]).strip() if m.get("dose") else None,
-                        schedule=str(m["schedule"]).strip() if m.get("schedule") else None,
-                        duration=str(m["duration"]).strip() if m.get("duration") else None,
-                        purpose=str(m["purpose"]).strip() if m.get("purpose") else None))
-            except Exception:
-                continue
-
-        bio = [b.model_dump() for b in r.biomarkers]
-        if r.report_type == ReportType.LAB and bio:
-            score = compute_health_score(bio)
-        else:
-            score = compute_document_score(self._str_list(p, "positives"), self._str_list(p, "concerns"))
-
-        patient_name = p.get("patient_name")
-        provider = p.get("lab_name") or p.get("provider")
-        return Report(
-            user_id=r.user_id, member_id=r.member_id,
-            filename=self._display_name(r.files), mime_type=r.files[0].mime_type,
-            storage_path=None, file_hash=hashlib.sha256(b"".join(r.raws)).hexdigest(),
-            uploaded_at=datetime.now(timezone.utc).isoformat(),
-            report_type=r.report_type, report_date=p.get("report_date"),
-            patient_name=str(patient_name).strip() if patient_name else None,
-            name_mismatch=not self._names_match(r.display_name, str(patient_name) if patient_name else None),
-            lab_name=str(provider).strip() if provider else None,
-            summary=_SCORE_IN_SUMMARY.sub("", str(p.get("summary") or "")).strip(),
-            overall_assessment=str(p.get("overall_assessment") or ""),
-            positives=self._str_list(p, "positives"), concerns=self._str_list(p, "concerns"),
-            suggestions=suggestions, biomarkers=r.biomarkers, health_score=score,
-            normal_count=sum(1 for b in bio if b["status"] == BiomarkerStatus.NORMAL),
-            attention_count=sum(1 for b in bio if b["status"] in _ATTENTION),
-            total_count=len(r.biomarkers),
-            chief_complaint=self._opt_str(p, "chief_complaint"),
-            exam_findings=self._str_list(p, "exam_findings"), diagnoses=self._str_list(p, "diagnoses"),
-            referrals=self._str_list(p, "referrals"), medications=medications,
-            modality=self._opt_str(p, "modality"), body_area=self._opt_str(p, "body_area"),
-            findings=self._str_list(p, "findings"), impression=self._opt_str(p, "impression"),
-            admission_date=p.get("admission_date"), discharge_date=p.get("discharge_date"),
-            procedures=self._str_list(p, "procedures"), follow_up=self._opt_str(p, "follow_up"),
-        )
+        return build_report(parsed=r.parsed, report_type=r.report_type, biomarkers=r.biomarkers, files=r.files,
+                            raws=r.raws, user_id=r.user_id, member_id=r.member_id, display=r.display_name,
+                            names_match=self._names_match)
 
     async def _persist(self, r: _Run, report: Report) -> AnalysisResult:
         stored = []
@@ -370,27 +283,6 @@ class AnalysisPipeline:
     async def _member_reports(user_id: str, member_id: str) -> list[dict]:
         rows = await cache.get_reports(user_id)
         return [x for x in rows if x.get("member_id", "self") == member_id]
-
-    @staticmethod
-    def _normalize_category(cat: str | None) -> str:
-        c = str(cat or "").strip().lower()
-        c = LEGACY_CATEGORY_MAP.get(c, c)
-        return c if c in SUGGESTION_CATEGORIES else "lifestyle"
-
-    @staticmethod
-    def _display_name(files: list[AnalyzeFileIn]) -> str:
-        return files[0].filename if len(files) == 1 else f"{files[0].filename} (+{len(files) - 1} pages)"
-
-    @staticmethod
-    def _str_list(p: dict, key: str) -> list[str]:
-        v = p.get(key) or []
-        if isinstance(v, str):
-            v = [v]
-        return [str(x).strip() for x in v if str(x).strip()]
-
-    @staticmethod
-    def _opt_str(p: dict, key: str) -> str | None:
-        return str(p[key]).strip() if p.get(key) else None
 
 
 pipeline = AnalysisPipeline()

@@ -24,8 +24,8 @@ from app.enums import JobStatus, Plan
 from app.models import AnalyzeFileIn, AnalyzeRequest
 from core.rate_limit import check_and_increment_daily_quota, refund_daily_quota
 from db import session as db
-from services.analysis import (MSG_PROVIDER, AnalysisRejected, InvalidUpload, UnsupportedDocument,
-                               pipeline)
+from services.analysis import MSG_PROVIDER, pipeline
+from services.analysis_types import AnalysisRejected, InvalidUpload, UnsupportedDocument
 from services.members import member_id_of
 
 logger = logging.getLogger(__name__)
@@ -203,9 +203,10 @@ class AnalyzeJobService:
 
     @staticmethod
     async def _mark(job_id: str, status: JobStatus, started: bool = False) -> None:
-        col = "started_at" if started else "completed_at"
-        await db.execute(f"update analyze_jobs set status = $1, {col} = $2 where job_id = $3",
-                         str(status), _iso(), job_id)
+        if started:
+            await db.execute("update analyze_jobs set status = $1, started_at = $2 where job_id = $3", str(status), _iso(), job_id)
+        else:
+            await db.execute("update analyze_jobs set status = $1, completed_at = $2 where job_id = $3", str(status), _iso(), job_id)
 
     @staticmethod
     async def _fail(job_id: str, message: str) -> None:

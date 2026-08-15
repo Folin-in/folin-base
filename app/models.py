@@ -256,3 +256,30 @@ class AnalyzeRequest(BaseModel):
 
 class ReportTitleUpdate(BaseModel):
     title: str = Field(min_length=1, max_length=80)
+
+
+# ---------- Auth request bodies ----------
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+
+
+class AppleLoginRequest(BaseModel):
+    identity_token: str
+    name: str | None = None  # Apple sends the name only on the FIRST sign-in
+
+
+class SupabaseSyncRequest(BaseModel):
+    """Only consulted when the identity is brand new; ignored for an existing account."""
+    name: str | None = None
+    username: str | None = None
+    consent: bool = False
+
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str

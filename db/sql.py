@@ -9,6 +9,7 @@ USERS_UPDATABLE = frozenset({
 })
 MEMBERS_UPDATABLE = frozenset({"name", "relation", "age", "gender", "allergies"})
 SOCIAL_ID_COLUMNS = frozenset({"google_id", "apple_id"})
+REPORTS_SELECTABLE = frozenset({"*", "biomarkers", "suggestions", "title", "storage_path", "report_type", "member_id"})
 
 
 class UnsafeColumn(ValueError):

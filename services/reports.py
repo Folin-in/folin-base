@@ -19,10 +19,11 @@ from app.enums import BiomarkerStatus, Language, ReportType
 from app.models import BiomarkerPatch, Report, ReportFeedbackIn, ReportTitleUpdate
 from core import cache, storage
 from db import session as db
+from db.sql import REPORTS_SELECTABLE, assert_columns
 from services.compare import valid_id
 from services.gamification import STATUS_WEIGHT, compute_health_score
 from services.members import member_id_of, resolve_member_profile
-from services.tips import normalize_category
+from services.report_mapper import normalize_category
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class ReportService:
     @staticmethod
     async def _owned(report_id: str, user_id: str, cols: str = "*") -> dict:
         _require_id(report_id)
+        assert_columns([c.strip() for c in cols.split(",")], REPORTS_SELECTABLE, "reports")
         doc = await db.fetchrow(
             f"select {cols} from reports where id = $1::uuid and user_id = $2 and deleted_at is null",
             report_id, user_id)

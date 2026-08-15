@@ -79,6 +79,10 @@ SOCIAL_TOKEN_ALGS = ("RS256",)
 SUPABASE_TOKEN_ALGS = ("ES256", "RS256")
 USERNAME_MAX_CHARS = 24
 USERNAME_PATTERN = r"[^a-zA-Z0-9_\.]"
+RESET_CODE_DIGITS = 6
+RESET_CODE_MAX = 10 ** RESET_CODE_DIGITS
+USERNAME_FALLBACK = "user"
+USER_ID_HEX = 12
 
 # --------------------------------------------------------------------- rate limits (per IP)
 class RateLimit:
@@ -87,7 +91,8 @@ class RateLimit:
     REGISTER = ("register", 10, 600)
     REFRESH = ("refresh", 30, 300)
     SOCIAL_LOGIN = ("social_login", 20, 300)
-    FORGOT_PASSWORD = ("forgot", 5, 900)
+    FORGOT_PASSWORD = ("forgot_password", 3, 3600)
+    RESET_PASSWORD = ("reset_password", 10, 600)
 
 
 DAILY_QUOTA_FREE_GENERIC = 20            # non-analyze buckets without a named override

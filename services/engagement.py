@@ -1,6 +1,9 @@
 """Behaviour events the gamification engine scores. XP rewards what the user DOES, never
 what their biology does - see gamification.py."""
 from db import session as db
+from services.gamification import EVENT_XP
+
+EVENT_XP_TYPES = frozenset(EVENT_XP)
 
 
 async def fetch_events(user_id: str) -> list[dict]:

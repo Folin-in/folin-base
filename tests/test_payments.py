@@ -21,7 +21,7 @@ import httpx  # noqa: E402
 from app.config import settings  # noqa: E402
 from core import rate_limit  # noqa: E402
 from db import session as db  # noqa: E402
-from routers.payments import expected_signature  # noqa: E402
+from services.payments import expected_signature  # noqa: E402
 from app.main import app  # noqa: E402
 
 # One loop for the whole run, owned by conftest - see its docstring.

@@ -22,7 +22,8 @@ from dataclasses import dataclass, field
 
 from agents import TipsReconciler
 from agents.tools import TOOLS
-from app.constants import DEFAULT_REPORT_TITLES, LEGACY_CATEGORY_MAP, SUGGESTION_CATEGORIES
+from app.constants import DEFAULT_REPORT_TITLES
+from services.report_mapper import normalize_category
 from app.enums import ReportType
 from app.models import Report
 from core import cache
@@ -35,11 +36,6 @@ MIN_TIPS_FOR_RECONCILE = 2
 MIN_ALLERGEN_CHARS = 3
 DEFAULT_CATEGORY = "lifestyle"
 
-
-def normalize_category(cat: str | None) -> str:
-    c = str(cat or "").strip().lower()
-    c = LEGACY_CATEGORY_MAP.get(c, c)
-    return c if c in SUGGESTION_CATEGORIES else DEFAULT_CATEGORY
 
 
 def default_title(report_type: str | None) -> str:
