@@ -36,7 +36,7 @@ FEEDBACK_ISSUES = frozenset({"wrong_value", "missed_marker", "wrong_status", "ba
 RETEST_AFTER_DAYS = 90
 COMPARE_ORDER = {"improved": 0, "worsened": 1, "same": 2}
 DEFAULT_REPORT_TITLES: dict[ReportType, str] = {
-    ReportType.LAB: "Lab report",
+    ReportType.LAB: "Blood panel",
     ReportType.OPD: "Clinic visit",
     ReportType.PRESCRIPTION: "Prescription",
     ReportType.IMAGING: "Imaging report",

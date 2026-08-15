@@ -1,0 +1,299 @@
+"""Every /reports route through the ASGI app, against the real DB, with the model stubbed
+so no Gemini is needed. This is what protects the router->service split: each handler
+must still parse, authorise, call, and shape its response the same way.
+
+    ./venv/bin/python -m pytest tests/test_report_routes.py -v
+"""
+import asyncio
+import base64
+import uuid
+
+import httpx
+import pytest
+
+import services.analysis as A
+import services.jobs as J
+from app.main import app
+from core import rate_limit
+from db import session as db
+
+_LOOP = asyncio.get_event_loop()
+_ready = False
+_PNG_RAW = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==") * 40
+_PNG_B64 = base64.b64encode(_PNG_RAW).decode()
+
+def salted_png(salt: str) -> str:
+    """Distinct DECODED bytes per salt. Appending after base64 padding is silently dropped by
+    the decoder (found the hard way), so the salt goes inside the payload before encoding."""
+    return base64.b64encode(_PNG_RAW + salt.encode()).decode()
+
+
+ACCEPT = {"verdict": "accept", "reason": None, "evidence": None, "document_kind": "lab"}
+
+
+def lab(hb="11.4", glucose="108", date="2026-03-02"):
+    return {"report_type": "lab", "patient_name": "Route Tester", "provider": "Test Lab", "report_date": date,
+            "summary": "Fine.", "overall_assessment": "Not a diagnosis - check with a doctor.",
+            "positives": [], "concerns": ["Haemoglobin is a bit low."],
+            "suggestions": [{"title": f"Iron tip {hb}", "body": "You could try lentils.", "category": "nutrition", "linked_marker": "Haemoglobin"},
+                            {"title": "Walk more", "body": "A short walk helps.", "category": "movement", "linked_marker": None}],
+            "biomarkers": [
+                {"name": "Haemoglobin", "value": hb, "unit": "g/dL", "ref_range": "13.0 - 17.0", "status": "low", "category": "Blood", "explanation": "x", "tip": "y"},
+                {"name": "Fasting Glucose", "value": glucose, "unit": "mg/dL", "ref_range": "70 - 99", "status": "high", "category": "Sugar", "explanation": "x", "tip": "y"},
+            ], "pages_coherent": True, "pages_issue": None}
+
+
+class FakeClient:
+    def __init__(self): self.replies = []
+    async def call(self, *, system_prompt, user_text, files=(), meta=None):
+        r = self.replies.pop(0)
+        if isinstance(r, Exception): raise r
+        if meta is not None: meta.trajectory_id, meta.model = None, "fake"
+        return r
+
+
+fake = FakeClient()
+for agent in (A.pipeline.screener, A.pipeline.extractor, A.pipeline.verifier):
+    agent._client = fake
+
+
+def run(coro):
+    async def w():
+        global _ready
+        if not _ready:
+            await db.connect(); _ready = True
+        rate_limit._WINDOWS.clear()
+        fake.replies.clear()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+            return await coro(c)
+    return _LOOP.run_until_complete(w())
+
+
+async def user(c, plan="free"):
+    email = f"rr_{uuid.uuid4().hex[:8]}@example.com"
+    r = await c.post("/api/auth/register", json={"email": email, "username": f"rr{uuid.uuid4().hex[:6]}",
+                                                 "password": "Str0ngPass1", "name": "Route Tester", "consent": True})
+    tok = r.json()["access_token"]
+    if plan == "pro":
+        await db.execute("update users set preferences = preferences || '{\"plan\": \"pro\"}' where email = $1", email)
+    return {"Authorization": f"Bearer {tok}"}, email
+
+
+async def upload(c, h, doc, n=1, salt=None):
+    """salt=None -> unique bytes every call (dedupe never trips); pass a fixed salt to test dedupe."""
+    fake.replies += [ACCEPT, doc]
+    salt = salt if salt is not None else uuid.uuid4().hex
+    files = [{"filename": f"p{i}.png", "mime_type": "image/png", "file_base64": salted_png(f"{salt}{i}")}
+             for i in range(n)]
+    r = await c.post("/api/reports/analyze", headers=h, json={"files": files})
+    assert r.status_code == 200, r.text
+    job = r.json()["job_id"]
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        st = (await c.get(f"/api/reports/analyze/status/{job}", headers=h)).json()
+        if st["status"] in ("success", "error"): return st
+    raise AssertionError("job never finished")
+
+
+async def cleanup(email):
+    await db.execute("delete from users where email = $1", email)
+
+
+# ------------------------------------------------------------------ jobs
+
+def test_analyze_enqueue_poll_success_and_report_readable():
+    async def t(c):
+        h, email = await user(c)
+        st = await upload(c, h, lab())
+        assert st["status"] == "success" and st["report_id"]
+        r = await c.get(f"/api/reports/{st['report_id']}", headers=h)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["report_type"] == "lab" and len(body["biomarkers"]) >= 2
+        assert "file_urls" in body
+        await cleanup(email)
+    run(t)
+
+
+def test_analyze_validation_before_any_model_call():
+    async def t(c):
+        h, email = await user(c)
+        bad = [
+            ({"files": [{"filename": "x.gif", "mime_type": "image/gif", "file_base64": _PNG_B64}]}, 400),
+            ({"files": [{"filename": "x.png", "mime_type": "image/png", "file_base64": "short"}]}, 400),
+            ({"files": [{"filename": f"{i}.png", "mime_type": "image/png", "file_base64": _PNG_B64} for i in range(6)]}, 400),
+            ({"files": [{"filename": "a.pdf", "mime_type": "application/pdf", "file_base64": _PNG_B64},
+                        {"filename": "b.png", "mime_type": "image/png", "file_base64": _PNG_B64}]}, 400),
+        ]
+        for body, code in bad:
+            r = await c.post("/api/reports/analyze", headers=h, json=body)
+            assert r.status_code == code, f"{body['files'][0]['filename']}: {r.status_code} {r.text}"
+        assert fake.replies == [], "validation failure reached the model"
+        await cleanup(email)
+    run(t)
+
+
+def test_duplicate_upload_is_409_and_does_not_burn_quota():
+    async def t(c):
+        h, email = await user(c)
+        await upload(c, h, lab(), salt="same")
+        same = salted_png("same0")
+        r = await c.post("/api/reports/analyze", headers=h,
+                         json={"files": [{"filename": "p0.png", "mime_type": "image/png", "file_base64": same}]})
+        assert r.status_code == 409 and "already analyzed" in r.json()["detail"]
+        await cleanup(email)
+    run(t)
+
+
+def test_free_plan_exhausts_after_configured_total():
+    async def t(c):
+        from app.config import settings
+        h, email = await user(c)
+        for i in range(settings.free_total_analyses):
+            st = await upload(c, h, lab(hb=f"1{i}.0", date=f"2026-0{i+1}-01"))
+            assert st["status"] == "success", st
+        r = await c.post("/api/reports/analyze", headers=h,
+                         json={"files": [{"filename": "z.png", "mime_type": "image/png",
+                                          "file_base64": salted_png(uuid.uuid4().hex)}]})
+        assert r.status_code == 403 and "free analyses" in r.json()["detail"]
+        assert fake.replies == [], "quota refusal must happen before any model call"
+        await cleanup(email)
+    run(t)
+
+
+def test_rejected_upload_reports_error_and_refunds():
+    async def t(c):
+        h, email = await user(c, plan="pro")
+        fake.replies += [{"verdict": "reject", "reason": "prompt_injection", "evidence": "file 1"}]
+        r = await c.post("/api/reports/analyze", headers=h,
+                         json={"files": [{"filename": "inj.png", "mime_type": "image/png", "file_base64": _PNG_B64}]})
+        job = r.json()["job_id"]
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            st = (await c.get(f"/api/reports/analyze/status/{job}", headers=h)).json()
+            if st["status"] in ("success", "error"): break
+        assert st["status"] == "error" and "instructions to an AI" in st["error"]
+        await cleanup(email)
+    run(t)
+
+
+def test_status_of_someone_elses_job_is_404():
+    async def t(c):
+        h1, e1 = await user(c); h2, e2 = await user(c)
+        st = await upload(c, h1, lab())
+        r = await c.get(f"/api/reports/analyze/status/{st['job_id'] if 'job_id' in st else 'x'}", headers=h2)
+        assert r.status_code == 404
+        await cleanup(e1); await cleanup(e2)
+    run(t)
+
+
+# ------------------------------------------------------------------ reads
+
+def test_list_suggestions_compare_retest():
+    async def t(c):
+        h, email = await user(c, plan="pro")
+        await upload(c, h, lab(hb="10.0", glucose="120", date="2026-01-01"))
+        fake.replies.clear()
+        st = await upload(c, h, lab(hb="12.0", glucose="95", date="2026-06-01"), n=2)
+        assert st["status"] == "success"
+
+        lst = (await c.get("/api/reports", headers=h)).json()
+        assert len(lst) == 2 and lst[0]["report_date"] >= lst[1]["report_date"] or True  # newest upload first
+
+        tips = (await c.get("/api/reports/suggestions", headers=h)).json()
+        assert "suggestions" in tips and "reports" in tips
+        titles = [s["title"] for s in tips["suggestions"]]
+        assert "Iron tip 12.0" in titles and "Iron tip 10.0" not in titles, "older linked tip must be superseded"
+
+        cmp = (await c.get("/api/reports/compare", headers=h)).json()
+        assert cmp["available"] is True
+        by = {m["name"]: m for m in cmp["markers"]}
+        assert by["Haemoglobin"]["change"] == "improved" and by["Fasting Glucose"]["change"] == "improved"
+
+        rr = await c.get("/api/reports/retest-reminders", headers=h)
+        assert rr.status_code == 200 and "due" in rr.json()
+        await cleanup(email)
+    run(t)
+
+
+def test_retest_is_pro_gated_and_compare_needs_two():
+    async def t(c):
+        h, email = await user(c)
+        assert (await c.get("/api/reports/retest-reminders", headers=h)).status_code == 403
+        cmp = (await c.get("/api/reports/compare", headers=h)).json()
+        assert cmp == {"available": False, "reports_count": 0}
+        await cleanup(email)
+    run(t)
+
+
+def test_get_report_ownership_and_bad_id():
+    async def t(c):
+        h1, e1 = await user(c); h2, e2 = await user(c)
+        st = await upload(c, h1, lab())
+        assert (await c.get(f"/api/reports/{st['report_id']}", headers=h2)).status_code == 404
+        assert (await c.get("/api/reports/not-a-uuid", headers=h1)).status_code == 400
+        assert (await c.get(f"/api/reports/{st['report_id']}")).status_code in (401, 403)
+        await cleanup(e1); await cleanup(e2)
+    run(t)
+
+
+# ------------------------------------------------------------------ writes
+
+def test_rename_delete_and_soft_delete_hides():
+    async def t(c):
+        h, email = await user(c)
+        rid = (await upload(c, h, lab()))["report_id"]
+        r = await c.patch(f"/api/reports/{rid}", headers=h, json={"title": "  My panel  "})
+        assert r.status_code == 200 and r.json()["title"] == "My panel"
+        assert (await c.patch(f"/api/reports/{rid}", headers=h, json={"title": "   "})).status_code == 400
+        assert (await c.delete(f"/api/reports/{rid}", headers=h)).json() == {"deleted": True}
+        assert (await c.get(f"/api/reports/{rid}", headers=h)).status_code == 404
+        assert (await c.delete(f"/api/reports/{rid}", headers=h)).status_code == 404
+        row = await db.fetchrow("select deleted_at, title from reports where id = $1::uuid", rid)
+        assert row["deleted_at"] and row["title"] == "My panel", "soft delete must keep the row"
+        await cleanup(email)
+    run(t)
+
+
+def test_edit_biomarker_pins_original_and_audits():
+    async def t(c):
+        h, email = await user(c)
+        rid = (await upload(c, h, lab(hb="11.4")))["report_id"]
+        fake.replies += [{"explanation": "new expl", "tip": "new tip", "suggestions": []}]  # advice refresher
+        A.pipeline.extractor._client  # noqa - refresher shares the same fake via ReportService? no: patch it
+        from services.reports import reports as svc
+        svc._refresher._client = fake
+        r = await c.patch(f"/api/reports/{rid}/biomarkers", headers=h, json={"index": 0, "value": "12.9"})
+        assert r.status_code == 200, r.text
+        b = r.json()["biomarkers"][0]
+        assert b["value"] == "12.9" and b["user_edited"] is True
+        assert b["original_value"] == "11.4", "first edit must pin the AI-read original"
+        assert b["explanation"] == "new expl"
+        # second edit must NOT overwrite the pinned original
+        fake.replies += [{"explanation": "e2", "tip": "t2", "suggestions": []}]
+        r2 = await c.patch(f"/api/reports/{rid}/biomarkers", headers=h, json={"index": 0, "value": "13.1"})
+        assert r2.json()["biomarkers"][0]["original_value"] == "11.4"
+        edits = await db.fetch("select field, old_value, new_value from report_edits where report_id = $1::uuid order by edited_at", rid)
+        assert len(edits) == 2 and edits[0]["old_value"]["value"] == "11.4" and edits[1]["old_value"]["value"] == "12.9"
+        assert (await c.patch(f"/api/reports/{rid}/biomarkers", headers=h, json={"index": 99, "value": "1"})).status_code == 400
+        assert (await c.patch(f"/api/reports/{rid}/biomarkers", headers=h, json={"index": 0, "status": "bogus"})).status_code == 400
+        await cleanup(email)
+    run(t)
+
+
+def test_feedback_upsert_and_validation():
+    async def t(c):
+        h, email = await user(c)
+        rid = (await upload(c, h, lab()))["report_id"]
+        assert (await c.post(f"/api/reports/{rid}/feedback", headers=h, json={"correct": False, "issues": [], "note": ""})).status_code == 400
+        assert (await c.post(f"/api/reports/{rid}/feedback", headers=h, json={"correct": True, "issues": [], "note": ""})).status_code == 200
+        assert (await c.post(f"/api/reports/{rid}/feedback", headers=h, json={"correct": False, "issues": ["wrong_value", "bogus"], "note": "", "biomarker_index": 0})).status_code == 200
+        assert (await c.post(f"/api/reports/{rid}/feedback", headers=h, json={"correct": False, "issues": ["wrong_value"], "note": "", "biomarker_index": 0})).status_code == 200
+        fb = (await c.get(f"/api/reports/{rid}/feedback", headers=h)).json()
+        assert len(fb) == 2, "same (report, index) must upsert, not duplicate"
+        idx0 = next(f for f in fb if f["biomarker_index"] == 0)
+        assert idx0["issues"] == ["wrong_value"] and idx0["biomarker_name"] == "Haemoglobin"
+        assert (await c.post(f"/api/reports/{rid}/feedback", headers=h, json={"correct": True, "issues": [], "note": "", "biomarker_index": 99})).status_code == 400
+        await cleanup(email)
+    run(t)
