@@ -202,8 +202,8 @@ class TestHardening1ClientIp:
 class TestHardening2Cors:
     def test_01_default_is_wildcard(self):
         import config
-        assert config.CORS_ALLOWED_ORIGINS == ["*"], (
-            f"Expected wildcard default in preview, got {config.CORS_ALLOWED_ORIGINS}"
+        assert settings.cors_allowed_origins == ["*"], (
+            f"Expected wildcard default in preview, got {settings.cors_allowed_origins}"
         )
 
     def test_02_subprocess_parses_comma_list(self):
@@ -216,7 +216,7 @@ class TestHardening2Cors:
                 sys.executable,
                 "-c",
                 "import sys; sys.path.insert(0, '/app/backend'); "
-                "import config; print(repr(config.CORS_ALLOWED_ORIGINS))",
+                "import config; print(repr(settings.cors_allowed_origins))",
             ],
             env=env,
             capture_output=True,
@@ -237,7 +237,7 @@ class TestHardening2Cors:
                 sys.executable,
                 "-c",
                 "import sys; sys.path.insert(0, '/app/backend'); "
-                "import config; print(repr(config.CORS_ALLOWED_ORIGINS))",
+                "import config; print(repr(settings.cors_allowed_origins))",
             ],
             env=env,
             capture_output=True,

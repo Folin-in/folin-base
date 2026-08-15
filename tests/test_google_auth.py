@@ -27,13 +27,13 @@ os.environ.setdefault("GOOGLE_CLIENT_IDS", "test-client-id.apps.googleuserconten
 import httpx  # noqa: E402
 import jwt as pyjwt  # noqa: E402
 
-import config  # noqa: E402
-import database as db  # noqa: E402
-import rate_limit  # noqa: E402
-from routers import auth as auth_router  # noqa: E402
-from server import app  # noqa: E402
+from app.config import settings  # noqa: E402
+from db import session as db  # noqa: E402
+from core import rate_limit  # noqa: E402
 
-AUD = config.GOOGLE_CLIENT_IDS[0]
+from app.main import app  # noqa: E402
+
+AUD = settings.google_client_ids[0]
 ISS = "https://accounts.google.com"
 
 _key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -60,7 +60,8 @@ class _FakeJWKS:
         return self
 
 
-auth_router._GOOGLE_JWKS = _FakeJWKS(_key.public_key())
+from services.auth_social import SocialAuthService  # noqa: E402
+SocialAuthService.google_jwks = _FakeJWKS(_key.public_key())
 
 
 def id_token(sub, email, *, aud=AUD, iss=ISS, verified=True, exp_delta=3600,
@@ -213,15 +214,15 @@ def test_missing_email_rejected():
     run(t)
 
 
-def test_not_configured_returns_503():
+def test_not_configured_returns_503(monkeypatch):
+    """Settings is frozen, so swap the whole object the router reads rather than mutate it."""
+    from dataclasses import replace
+    import services.auth_social as auth_svc
+    monkeypatch.setattr(auth_svc, "settings", replace(settings, google_client_ids=[]))
+
     async def t(c):
-        saved = config.GOOGLE_CLIENT_IDS
-        config.GOOGLE_CLIENT_IDS = []
-        try:
-            r = await c.post("/api/auth/google", json={"id_token": id_token("s", "x@example.com")})
-            assert r.status_code == 503
-        finally:
-            config.GOOGLE_CLIENT_IDS = saved
+        r = await c.post("/api/auth/google", json={"id_token": id_token("s", "x@example.com")})
+        assert r.status_code == 503
 
     run(t)
 

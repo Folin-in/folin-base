@@ -20,13 +20,13 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 import httpx  # noqa: E402
 import jwt as pyjwt  # noqa: E402
 
-import config  # noqa: E402
-import database as db  # noqa: E402
-import rate_limit  # noqa: E402
-import security  # noqa: E402
-from server import app  # noqa: E402
+from app.config import settings  # noqa: E402
+from db import session as db  # noqa: E402
+from core import rate_limit  # noqa: E402
+from core import security  # noqa: E402
+from app.main import app  # noqa: E402
 
-ISS = f"{config.SUPABASE_URL}/auth/v1"
+ISS = f"{settings.supabase_url}/auth/v1"
 
 _key = ec.generate_private_key(ec.SECP256R1())
 _PRIV = _key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
