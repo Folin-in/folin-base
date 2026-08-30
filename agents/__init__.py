@@ -6,9 +6,10 @@ from agents.extractor import ExtractorAgent
 from agents.reconciler import TipsReconciler
 from agents.refresher import AdviceRefresher
 from agents.screener import ScreenerAgent
+from agents.transcriber import TranscriberAgent
 from agents.verifier import VerifierAgent
 
 __all__ = [
-    "ExtractorAgent", "ScreenerAgent", "VerifierAgent", "AdviceRefresher", "TipsReconciler",
+    "ExtractorAgent", "ScreenerAgent", "TranscriberAgent", "VerifierAgent", "AdviceRefresher", "TipsReconciler",
     "OutputAuditor", "DocumentRejected",
 ]

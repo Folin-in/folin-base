@@ -213,6 +213,8 @@ class Report(BaseDocument):
     overall_assessment: str = ""
     positives: List[str] = []
     concerns: List[str] = []
+    # Verbatim interpretive comments printed by the lab. Not Folin's words - never edited.
+    lab_notes: List[str] = []
     suggestions: List[Suggestion] = []
     # Lab-report fields
     biomarkers: List[Biomarker] = []

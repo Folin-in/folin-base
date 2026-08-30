@@ -70,6 +70,7 @@ class RejectReason(StrEnum):
 class TrajectoryKind(StrEnum):
     """Which agent produced a row in ai_trajectories."""
     SCREEN = "screen"
+    TRANSCRIBE = "transcribe"
     ANALYZE = "analyze"
     VERIFY = "verify"
     REFRESH_ADVICE = "refresh_advice"

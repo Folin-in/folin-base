@@ -187,3 +187,12 @@ async def get_current_user(request: Request) -> dict:
         return await _expire_pro_if_due(await _user_from_supabase(claims))
 
     raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+async def get_admin_user(request: Request) -> dict:
+    """Admin gate. Returns 404 rather than 403 so the dashboard's existence is not
+    confirmable by a signed-in non-admin, matching how ownership failures behave."""
+    user = await get_current_user(request)
+    if (user.get("email") or "").lower() not in settings.admin_emails:
+        raise HTTPException(status_code=404, detail="Not found")
+    return user
