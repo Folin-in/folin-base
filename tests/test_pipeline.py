@@ -54,6 +54,11 @@ class FakeClient:
         return r
 
 
+class EmptyTranscriptClient:
+    async def call(self, **_):
+        return {"results": [], "notes": []}
+
+
 def run(coro):
     async def w():
         global _ready
@@ -68,6 +73,7 @@ def pipeline_with(*replies) -> A.AnalysisPipeline:
     fake = FakeClient(replies)
     for agent in (p.screener, p.extractor, p.verifier):
         agent._client = fake
+    p.transcriber._client = EmptyTranscriptClient()
     p._fake = fake
     return p
 

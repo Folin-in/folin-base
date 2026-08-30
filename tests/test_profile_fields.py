@@ -58,7 +58,8 @@ def throwaway(s):
     username = f"TEST_throw_{uid}"
     r = s.post(
         f"{API}/auth/register",
-        json={"email": email, "username": username, "password": "Password@123", "name": "Throwaway"},
+        json={"email": email, "username": username, "password": "Password@123",
+              "name": "Throwaway", "consent": True},
     )
     assert r.status_code == 200, r.text
     body = r.json()

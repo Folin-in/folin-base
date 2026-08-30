@@ -8,6 +8,7 @@ from starlette.middleware.cors import CORSMiddleware
 from app.config import settings
 from db import session as database
 from routers import admin, auth, family, members, payments, reports, users
+from services.jobs import jobs
 
 API_PREFIX = "/api"
 API_TITLE = "Folin API"
@@ -20,8 +21,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await database.connect()
-    yield
-    await database.close()
+    await jobs.start()
+    try:
+        yield
+    finally:
+        await jobs.stop()
+        await database.close()
 
 
 app = FastAPI(title=API_TITLE, lifespan=lifespan)

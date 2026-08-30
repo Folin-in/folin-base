@@ -46,7 +46,7 @@ def _register(email, username, name, ip=None):
         headers["X-Forwarded-For"] = ip
     r = requests.post(
         f"{API}/auth/register",
-        json={"email": email, "username": username, "name": name, "password": PW},
+        json={"email": email, "username": username, "name": name, "password": PW, "consent": True},
         headers=headers,
         timeout=30,
     )

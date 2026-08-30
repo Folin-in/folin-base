@@ -47,6 +47,7 @@ def user2(s):
         "username": f"TEST_u2_{uid}",
         "password": "Password@123",
         "name": "TEST U2",
+        "consent": True,
     }
     r = s.post(f"{API}/auth/register", json=payload)
     assert r.status_code == 200, f"register user2 failed: {r.status_code} {r.text}"
@@ -82,7 +83,7 @@ class TestAuthRegisterLogin:
     def test_register_duplicate_email_400(self, s, user2):
         r = s.post(f"{API}/auth/register", json={
             "email": user2["email"], "username": f"TEST_diff_{uuid.uuid4().hex[:6]}",
-            "password": "Password@123", "name": "dup",
+            "password": "Password@123", "name": "dup", "consent": True,
         })
         assert r.status_code == 400
         assert "Email" in r.json().get("detail", "")
@@ -90,7 +91,7 @@ class TestAuthRegisterLogin:
     def test_register_duplicate_username_400(self, s, user2):
         r = s.post(f"{API}/auth/register", json={
             "email": f"TEST_diff_{uuid.uuid4().hex[:6]}@vqtest.com",
-            "username": user2["username"], "password": "Password@123", "name": "dup",
+            "username": user2["username"], "password": "Password@123", "name": "dup", "consent": True,
         })
         assert r.status_code == 400
         assert "Username" in r.json().get("detail", "")
@@ -98,7 +99,7 @@ class TestAuthRegisterLogin:
     def test_register_short_password_422(self, s):
         r = s.post(f"{API}/auth/register", json={
             "email": f"TEST_sp_{uuid.uuid4().hex[:6]}@vqtest.com",
-            "username": f"TEST_sp_{uuid.uuid4().hex[:6]}", "password": "abc", "name": "x",
+            "username": f"TEST_sp_{uuid.uuid4().hex[:6]}", "password": "abc", "name": "x", "consent": True,
         })
         assert r.status_code == 422
 

@@ -1,5 +1,6 @@
-"""Runtime configuration. Every value comes from the environment with no fallback, and is
-validated once at import so a misconfigured deploy fails at boot instead of mid-request.
+"""Runtime configuration. Values come from the environment and are validated once at
+import so a misconfigured deploy fails at boot instead of mid-request. Optional values
+are called out explicitly in `.env.example`.
 
 `settings` is the single instance the rest of the code imports.
 """
@@ -24,7 +25,7 @@ def _req(name: str) -> str:
     try:
         return os.environ[name]
     except KeyError:
-        raise ConfigError(f"{name} is not set. Every setting is required - see .env.example.") from None
+        raise ConfigError(f"Required setting {name} is not set - see .env.example.") from None
 
 
 def _int(name: str) -> int:

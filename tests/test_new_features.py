@@ -23,7 +23,8 @@ def _register(s, email=None, username=None, password="Password@123", name="TEST"
     uid = uuid.uuid4().hex[:8]
     email = email or f"TEST_{uid}@vqtest.com"
     username = username or f"TEST_{uid}"
-    r = s.post(f"{API}/auth/register", json={"email": email, "username": username, "password": password, "name": name})
+    r = s.post(f"{API}/auth/register", json={"email": email, "username": username,
+                                              "password": password, "name": name, "consent": True})
     assert r.status_code == 200, f"register failed: {r.status_code} {r.text}"
     body = r.json()
     return {

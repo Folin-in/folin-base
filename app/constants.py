@@ -18,6 +18,7 @@ MIN_FILE_BASE64_CHARS = 512               # smaller than this can never be a rea
 MAX_UPLOAD_BASE64_BYTES = 14 * 1024 * 1024  # ~10 MB decoded; reject before decoding
 ANALYZE_JOB_TIMEOUT_SECS = 540
 ANALYZE_JOB_GRACE_SECS = 30               # a 'processing' row older than timeout+grace is dead
+ANALYZE_WORKER_POLL_SECS = 2              # picks up jobs enqueued by another API worker
 # A healthy extractor call on a 14-page scan measures ~33s once thinking is bounded, so a
 # call still open at 120s is queued behind free-tier congestion, not working. Fail over
 # fast instead: the retry rounds below only help if each attempt is cheap.

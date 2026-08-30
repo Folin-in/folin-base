@@ -42,9 +42,13 @@ class FakeClient:
         return r
 
 
+class EmptyTranscriptClient:
+    async def call(self, **_):
+        return {"results": [], "notes": []}
+
+
 fake = FakeClient()
-for agent in (A.pipeline.screener, A.pipeline.extractor, A.pipeline.verifier):
-    agent._client = fake
+empty_transcript = EmptyTranscriptClient()
 
 
 def run(coro):
@@ -53,8 +57,17 @@ def run(coro):
         if not _ready:
             await db.connect(); _ready = True
         rate_limit._WINDOWS.clear(); fake.replies.clear()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-            return await coro(c)
+        targets = (A.pipeline.screener, A.pipeline.extractor, A.pipeline.verifier, A.pipeline.transcriber)
+        previous = [agent._client for agent in targets]
+        replacements = (fake, fake, fake, empty_transcript)
+        for agent, client in zip(targets, replacements):
+            agent._client = client
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+                return await coro(c)
+        finally:
+            for agent, client in zip(targets, previous):
+                agent._client = client
     return _LOOP.run_until_complete(w())
 
 
@@ -189,7 +202,12 @@ def test_forged_and_tampered_tokens_are_rejected():
         import jwt, time
         ha, a_id, ea = await user(c)
         # token signed with the wrong secret, claiming to be A
-        forged = jwt.encode({"sub": a_id, "type": "access", "tv": 0, "iat": int(time.time()), "exp": int(time.time()) + 600}, "not-the-secret", algorithm="HS256")
+        forged = jwt.encode(
+            {"sub": a_id, "type": "access", "tv": 0, "iat": int(time.time()),
+             "exp": int(time.time()) + 600},
+            "wrong-signing-key-that-is-still-long-enough-for-hs256",
+            algorithm="HS256",
+        )
         assert (await c.get("/api/reports", headers={"Authorization": f"Bearer {forged}"})).status_code == 401
         # a real token whose payload is edited to another sub (signature no longer matches)
         real = ha["Authorization"].split()[1]

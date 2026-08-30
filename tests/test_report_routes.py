@@ -53,9 +53,13 @@ class FakeClient:
         return r
 
 
+class EmptyTranscriptClient:
+    async def call(self, **_):
+        return {"results": [], "notes": []}
+
+
 fake = FakeClient()
-for agent in (A.pipeline.screener, A.pipeline.extractor, A.pipeline.verifier):
-    agent._client = fake
+empty_transcript = EmptyTranscriptClient()
 
 
 def run(coro):
@@ -65,8 +69,19 @@ def run(coro):
             await db.connect(); _ready = True
         rate_limit._WINDOWS.clear()
         fake.replies.clear()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-            return await coro(c)
+        from services.reports import reports as report_service
+        targets = (A.pipeline.screener, A.pipeline.extractor, A.pipeline.verifier,
+                   A.pipeline.transcriber, report_service._refresher)
+        previous = [agent._client for agent in targets]
+        replacements = (fake, fake, fake, empty_transcript, fake)
+        for agent, client in zip(targets, replacements):
+            agent._client = client
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+                return await coro(c)
+        finally:
+            for agent, client in zip(targets, previous):
+                agent._client = client
     return _LOOP.run_until_complete(w())
 
 
@@ -112,6 +127,31 @@ def test_analyze_enqueue_poll_success_and_report_readable():
         body = r.json()
         assert body["report_type"] == "lab" and len(body["biomarkers"]) >= 2
         assert "file_urls" in body
+        payload = await db.fetchval("select request_payload from analyze_jobs where job_id = $1", st["job_id"])
+        assert payload is None, "medical upload payload must be erased after completion"
+        await cleanup(email)
+    run(t)
+
+
+def test_pending_job_can_be_claimed_and_recovered():
+    async def t(c):
+        h, email = await user(c, plan="pro")
+        uid = await db.fetchval("select user_id from users where email = $1", email)
+        job_id = uuid.uuid4().hex[:16]
+        body = {"files": [{"filename": "recover.png", "mime_type": "image/png",
+                           "file_base64": salted_png("recoverable")}]}
+        await db.execute(
+            """insert into analyze_jobs
+               (job_id, user_id, member_id, filename, mime_type, status, created_at, request_payload)
+               values ($1, $2, 'self', 'recover.png', 'image/png', 'pending', $3, $4)""",
+            job_id, uid, "2026-08-30T00:00:00+00:00", body)
+        fake.replies += [ACCEPT, lab()]
+        claimed = await J.jobs._claim(job_id)
+        assert claimed and claimed["job_id"] == job_id
+        await J.jobs._execute_claimed(claimed)
+        row = await db.fetchrow(
+            "select status, report_id, request_payload from analyze_jobs where job_id = $1", job_id)
+        assert row["status"] == "success" and row["report_id"] and row["request_payload"] is None
         await cleanup(email)
     run(t)
 
@@ -261,9 +301,6 @@ def test_edit_biomarker_pins_original_and_audits():
         h, email = await user(c)
         rid = (await upload(c, h, lab(hb="11.4")))["report_id"]
         fake.replies += [{"explanation": "new expl", "tip": "new tip", "suggestions": []}]  # advice refresher
-        A.pipeline.extractor._client  # noqa - refresher shares the same fake via ReportService? no: patch it
-        from services.reports import reports as svc
-        svc._refresher._client = fake
         r = await c.patch(f"/api/reports/{rid}/biomarkers", headers=h, json={"index": 0, "value": "12.9"})
         assert r.status_code == 200, r.text
         b = r.json()["biomarkers"][0]

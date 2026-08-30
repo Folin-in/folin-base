@@ -90,6 +90,7 @@ def user2(s):
         "username": f"TEST_it17_{uid}",
         "password": "Password@123",
         "name": "TEST IT17",
+        "consent": True,
     }
     r = s.post(f"{API}/auth/register", json=payload)
     assert r.status_code == 200, f"register user2 failed: {r.status_code} {r.text}"
