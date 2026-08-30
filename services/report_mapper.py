@@ -67,7 +67,8 @@ def medications_from(p: dict) -> list[Medication]:
 
 
 def build_report(*, parsed: dict, report_type: ReportType, biomarkers: list[Biomarker], files: list[AnalyzeFileIn],
-                 raws: list[bytes], user_id: str, member_id: str, display: str, names_match) -> Report:
+                 raws: list[bytes], user_id: str, member_id: str, display: str, names_match,
+                 lab_notes: list[str] | None = None) -> Report:
     p = parsed
     bio = [b.model_dump() for b in biomarkers]
     if report_type == ReportType.LAB and bio:
@@ -87,6 +88,7 @@ def build_report(*, parsed: dict, report_type: ReportType, biomarkers: list[Biom
         summary=_SCORE_IN_SUMMARY.sub("", str(p.get("summary") or "")).strip(),
         overall_assessment=str(p.get("overall_assessment") or ""),
         positives=str_list(p, "positives"), concerns=str_list(p, "concerns"),
+        lab_notes=list(lab_notes or []),
         suggestions=suggestions_from(p), biomarkers=biomarkers, health_score=score,
         normal_count=sum(1 for b in bio if b["status"] == BiomarkerStatus.NORMAL),
         attention_count=sum(1 for b in bio if b["status"] in _ATTENTION),

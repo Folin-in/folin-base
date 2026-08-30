@@ -21,13 +21,16 @@ from core import cache, storage
 from db import session as db
 from db.sql import REPORTS_SELECTABLE, assert_columns
 from services.compare import valid_id
-from services.gamification import STATUS_WEIGHT, compute_health_score
+from services.scoring import compute_health_score
 from services.members import member_id_of, resolve_member_profile
 from services.report_mapper import normalize_category
 
 logger = logging.getLogger(__name__)
 
 ATTENTION = {BiomarkerStatus.HIGH, BiomarkerStatus.LOW}
+# What a user may set a marker to. Kept off the scoring tables so tuning a weight
+# can never change which values the API accepts.
+EDITABLE_STATUSES = frozenset(str(s) for s in BiomarkerStatus)
 MSG_BAD_ID = "Invalid report id"
 MSG_NOT_FOUND = "Report not found"
 MSG_EMPTY_TITLE = "Title cannot be empty."
@@ -130,8 +133,8 @@ class ReportService:
         biomarkers = list(doc.get("biomarkers") or [])
         if req.index < 0 or req.index >= len(biomarkers):
             raise HTTPException(status_code=400, detail=MSG_INDEX)
-        if req.status is not None and req.status not in STATUS_WEIGHT:
-            raise HTTPException(status_code=400, detail=f"status must be one of {sorted(STATUS_WEIGHT)}")
+        if req.status is not None and req.status not in EDITABLE_STATUSES:
+            raise HTTPException(status_code=400, detail=f"status must be one of {sorted(EDITABLE_STATUSES)}")
 
         b = dict(biomarkers[req.index])
         old = {"value": b.get("value"), "status": b.get("status"), "tip": b.get("tip"), "explanation": b.get("explanation")}

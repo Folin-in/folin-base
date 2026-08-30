@@ -4,6 +4,7 @@ The rules it applies live in gamification_rules.py.
 """
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
+from services.scoring import compute_health_score  # noqa: F401  (re-exported)
 from services.gamification_rules import (BADGE_DEFS, CATEGORY_WEIGHTS, EVENT_DAILY_CAP, EVENT_ONCE, EVENT_XP, FIRST_IN_WINDOW_DAYS, RETEST_MAX_DAYS, RETEST_MIN_DAYS, RETEST_TARGET_DAYS, RETIRED_BADGE_DEFS, RETIRED_BADGE_IDS, STATUS_WEIGHT, XP_FIRST_UPLOAD, XP_ON_TIME_RETEST, XP_PER_LEVEL, XP_REPEAT_UPLOAD, XP_TRACKED_CAP, XP_TRACKED_FLAGGED)
 
 
@@ -36,23 +37,9 @@ def _parse_effective(r: dict) -> Optional[date]:
         return None
 
 
-# ---------- Scoring (unchanged) ----------
-def compute_health_score(biomarkers: List[dict]) -> int:
-    """Weighted average. Categories with higher clinical importance count more."""
-    if not biomarkers:
-        return 0
-    num = 0.0
-    den = 0.0
-    for b in biomarkers:
-        sw = STATUS_WEIGHT.get(b.get("status", "normal"), 0.6)
-        cw = CATEGORY_WEIGHTS.get((b.get("category") or "Other").strip(), 1.0)
-        num += sw * cw
-        den += cw
-    if den == 0:
-        return 0
-    return round(100 * num / den)
-
-
+# ---------- Scoring ----------
+# The lab score lives in services/scoring.py - it is panel-size independent and reads
+# severity from the printed reference interval. Re-exported so callers keep one import.
 def compute_document_score(positives: List[str], concerns: List[str]) -> int:
     p, c = len(positives or []), len(concerns or [])
     if p == 0 and c == 0:

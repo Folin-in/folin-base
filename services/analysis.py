@@ -10,6 +10,7 @@ and lets provider faults propagate (502, refunded).
 """
 import base64
 import logging
+import re
 import os
 import tempfile
 import uuid
@@ -18,7 +19,8 @@ from datetime import datetime, timezone
 
 from core import cache
 from core import storage
-from agents import DocumentRejected, ExtractorAgent, OutputAuditor, ScreenerAgent, VerifierAgent
+from agents import (DocumentRejected, ExtractorAgent, OutputAuditor, ScreenerAgent,
+                    TranscriberAgent, VerifierAgent)
 from agents.base import BadModelReply, ModelUnavailable
 from agents.registry import get as get_spec
 from agents.tools import TOOLS
@@ -31,15 +33,31 @@ from services.analysis_types import AnalysisRejected, AnalysisResult, InvalidUpl
 from services.report_mapper import build_report, display_name
 from services.engagement import fetch_events
 from services.members import member_id_of, resolve_member_profile
+from services.scoring import status_from_range
 
 logger = logging.getLogger(__name__)
 
+
+def _marker_key(name) -> str:
+    """Match names across the two passes without tripping on case or punctuation."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
 MAX_DECODED_BYTES = 10 * 1024 * 1024
-BMI_BANDS = ((17.0, BiomarkerStatus.LOW), (18.5, BiomarkerStatus.BORDERLINE_LOW),
-             (25.0, BiomarkerStatus.NORMAL), (30.0, BiomarkerStatus.BORDERLINE_HIGH))
-BMI_REF_RANGE = "18.5 - 24.9"
+# BMI cut-offs are population-specific. Indians carry cardiometabolic risk at a lower BMI,
+# so WHO's Asia-Pacific / ICMR thresholds put overweight at 23 and obese at 25, against the
+# international 25 and 30. Using the international band told a 24.7 BMI it was "normal".
+# Driven by the user's own region preference rather than assumed.
+BMI_BANDS_ASIA = ((17.0, BiomarkerStatus.LOW), (18.5, BiomarkerStatus.BORDERLINE_LOW),
+                  (23.0, BiomarkerStatus.NORMAL), (25.0, BiomarkerStatus.BORDERLINE_HIGH))
+BMI_BANDS_INTL = ((17.0, BiomarkerStatus.LOW), (18.5, BiomarkerStatus.BORDERLINE_LOW),
+                  (25.0, BiomarkerStatus.NORMAL), (30.0, BiomarkerStatus.BORDERLINE_HIGH))
+BMI_REF_RANGE_ASIA = "18.5 - 22.9"
+BMI_REF_RANGE_INTL = "18.5 - 24.9"
+REGION_ASIA = "india"
 BMI_UNIT = "kg/m²"
 VERIFY_NOTE_MAX = 300
+LAB_NOTES_MAX = 12                 # interpretive comments printed by the lab itself
+DEFAULT_CATEGORY = "Other"
 
 MSG_INVALID_FILE = "Invalid file data."
 MSG_TOO_LARGE = "Files too large (max 10 MB total). Try photos of the report instead of scans, or compress the PDF."
@@ -66,6 +84,9 @@ class _Run:
     profile_context: str = ""
     existing: list[dict] = field(default_factory=list)
     parsed: dict = field(default_factory=dict)
+    transcript: list[dict] = field(default_factory=list)
+    lab_notes: list[str] = field(default_factory=list)
+    recovered: int = 0
     report_type: ReportType = ReportType.OTHER
     biomarkers: list[Biomarker] = field(default_factory=list)
     analyze_trajectory: tuple[int | None, str | None] = (None, None)
@@ -77,11 +98,12 @@ class AnalysisPipeline:
 
     def __init__(self):
         spec = get_spec("analysis_pipeline")
-        for sub in ("screener", "extractor", "auditor", "verifier"):
+        for sub in ("screener", "transcriber", "extractor", "auditor", "verifier"):
             spec.assert_may_call(subagent=sub)
         for tool in ("sanity_bounds", "name_match"):
             spec.assert_may_call(tool=tool)
         self.screener = ScreenerAgent()
+        self.transcriber = TranscriberAgent()
         self.extractor = ExtractorAgent()
         self.auditor = OutputAuditor()
         self.verifier = VerifierAgent()
@@ -98,6 +120,7 @@ class AnalysisPipeline:
             await self._context(r)
             self._materialise(r)
             await self._screen(r)
+            await self._transcribe(r)
             await self._extract(r)
             self._audit(r)
             self._biomarkers(r)
@@ -150,10 +173,55 @@ class AnalysisPipeline:
             logger.warning("rejected at screen: %s :: %s", rej.reason, rej.evidence)
             raise AnalysisRejected(rej.user_message, rej.reason, rej.evidence)
 
+    async def _transcribe(self, r: _Run) -> None:
+        """Enumerate every printed result row. Fails open: a transcription that does not
+        come back costs the completeness guarantee, not the whole upload."""
+        try:
+            parsed, _ = await self.transcriber.run(r.attachments, user_id=r.user_id)
+        except Exception as e:
+            logger.warning("transcriber failed (continuing without it): %s", e)
+            return
+        rows = parsed.get("results") if isinstance(parsed, dict) else None
+        r.transcript = [x for x in (rows or []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
+        r.lab_notes = [str(n).strip() for n in (parsed.get("notes") or []) if str(n).strip()][:LAB_NOTES_MAX]
+        logger.info("transcribed %d result rows, %d lab notes", len(r.transcript), len(r.lab_notes))
+
+    def _reconcile_transcript(self, r: _Run) -> None:
+        """Anything the transcriber saw but the extractor did not return is added back.
+
+        This is the completeness guarantee, and it is deterministic on purpose: the status
+        comes from the printed reference interval, not from a second opinion, so a model
+        that skips rows can no longer lose them.
+        """
+        if not r.transcript or r.report_type != ReportType.LAB:
+            return
+        have = {_marker_key(b.get("name")) for b in (r.parsed.get("biomarkers") or [])}
+        recovered = []
+        for row in r.transcript:
+            key = _marker_key(row.get("name"))
+            if not key or key in have:
+                continue
+            have.add(key)                      # a page repeated in two photos must not double up
+            recovered.append({
+                "name": str(row.get("name")).strip(),
+                "value": str(row.get("value") or "").strip(),
+                "unit": str(row.get("unit") or "").strip(),
+                "ref_range": str(row.get("ref_range") or "").strip(),
+                "status": status_from_range(row.get("value"), row.get("ref_range")),
+                "category": DEFAULT_CATEGORY,
+                "explanation": "",
+                "tip": "",
+            })
+        if recovered:
+            r.parsed["biomarkers"] = list(r.parsed.get("biomarkers") or []) + recovered
+            r.recovered = len(recovered)
+            logger.info("recovered %d result rows the extractor omitted", r.recovered)
+
     async def _extract(self, r: _Run) -> None:
         try:
             r.parsed, meta = await self.extractor.run(r.attachments, r.profile_context,
-                                                     language=r.language, user_id=r.user_id)
+                                                     language=r.language, transcript=r.transcript,
+                                                     user_id=r.user_id)
         except BadModelReply:
             raise UnsupportedDocument(MSG_UNREADABLE)
         if meta:
@@ -171,6 +239,7 @@ class AnalysisPipeline:
             r.report_type = ReportType(rt)
         except ValueError:
             r.report_type = ReportType.LAB if r.parsed.get("biomarkers") else ReportType.OTHER
+        self._reconcile_transcript(r)
 
     def _audit(self, r: _Run) -> None:
         try:
@@ -208,9 +277,12 @@ class AnalysisPipeline:
         if any(b.name.strip().lower() == "bmi" for b in r.biomarkers):
             return
         bmi = round(w / ((h / 100) ** 2), 1)
-        status = next((s for limit, s in BMI_BANDS if bmi < limit), BiomarkerStatus.HIGH)
+        region = str((r.user.get("preferences") or {}).get("region") or REGION_ASIA).lower()
+        bands = BMI_BANDS_ASIA if region == REGION_ASIA else BMI_BANDS_INTL
+        ref_range = BMI_REF_RANGE_ASIA if region == REGION_ASIA else BMI_REF_RANGE_INTL
+        status = next((s for limit, s in bands if bmi < limit), BiomarkerStatus.HIGH)
         r.biomarkers.append(Biomarker(
-            name="BMI", value=str(bmi), unit=BMI_UNIT, ref_range=BMI_REF_RANGE, status=status, category="Other",
+            name="BMI", value=str(bmi), unit=BMI_UNIT, ref_range=ref_range, status=status, category="Other",
             explanation=f"Body Mass Index, worked out from your profile ({w} kg, {h} cm). It's a rough gauge of weight for your height - not a full picture of health on its own.",
             tip="This comes from your profile, not the lab report - keep your weight and height up to date there so it stays accurate.",
         ))
@@ -238,6 +310,7 @@ class AnalysisPipeline:
 
     def _assemble(self, r: _Run) -> Report:
         return build_report(parsed=r.parsed, report_type=r.report_type, biomarkers=r.biomarkers, files=r.files,
+                            lab_notes=r.lab_notes,
                             raws=r.raws, user_id=r.user_id, member_id=r.member_id, display=r.display_name,
                             names_match=self._names_match)
 

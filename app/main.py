@@ -7,7 +7,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from db import session as database
-from routers import auth, family, members, payments, reports, users
+from routers import admin, auth, family, members, payments, reports, users
 
 API_PREFIX = "/api"
 API_TITLE = "Folin API"
@@ -34,7 +34,8 @@ async def root():
     return {"message": API_TITLE, "status": "ok"}
 
 
-for r in (auth.router, reports.router, users.router, family.router, members.router, payments.router):
+for r in (auth.router, reports.router, users.router, family.router, members.router,
+          payments.router, admin.router):
     api_router.include_router(r)
 
 app.include_router(api_router)

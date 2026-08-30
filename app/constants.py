@@ -16,10 +16,31 @@ ALLOWED_MIME: dict[str, str] = {
 MAX_ANALYZE_FILES = 5
 MIN_FILE_BASE64_CHARS = 512               # smaller than this can never be a readable report
 MAX_UPLOAD_BASE64_BYTES = 14 * 1024 * 1024  # ~10 MB decoded; reject before decoding
-ANALYZE_JOB_TIMEOUT_SECS = 180
+ANALYZE_JOB_TIMEOUT_SECS = 540
 ANALYZE_JOB_GRACE_SECS = 30               # a 'processing' row older than timeout+grace is dead
+# A healthy extractor call on a 14-page scan measures ~33s once thinking is bounded, so a
+# call still open at 120s is queued behind free-tier congestion, not working. Fail over
+# fast instead: the retry rounds below only help if each attempt is cheap.
 GEMINI_CALL_TIMEOUT_SECS = 120
+# Gemini 3 shares one 65k budget between thinking and answer tokens. Left unset, thinking on a
+# multi-page scan ran to 62k tokens (236s) and starved the answer, truncating the JSON mid-field.
+GEMINI_THINKING_LEVEL = "high"
 MODEL_COOLDOWN_SECS = 120                 # a failed model is skipped for this long
+# Gemini answers 503 "high demand" intermittently; one pass over the models gives up in ~14s
+# on a fault its own error text calls temporary. Re-sweep the models before failing the job.
+# Backoff is linear (round_no * backoff), so 4 rounds waits 0/20/40/60s = 2 min of patience
+# inside the job's own budget. A congestion spell outlasts seconds, and a job that fails in
+# 36s has spent none of the 540s it reserved.
+MODEL_RETRY_ROUNDS = 4
+MODEL_RETRY_BACKOFF_SECS = 20
+
+# --------------------------------------------------------------------- admin metrics
+# Windows the dashboard rolls up over. Timestamps are ISO-8601 UTC text, which sorts
+# lexicographically, so a cutoff string compares directly against the stored column.
+METRIC_WINDOWS: dict[str, int] = {"24h": 1, "7d": 7, "30d": 30}
+METRIC_TOP_ERRORS = 8
+METRIC_RECENT_JOBS = 20
+METRIC_SLOW_CALL_MS = 60_000               # a model call past this is worth a second look
 
 # --------------------------------------------------------------------- report semantics
 SCORING_TYPES: frozenset[ReportType] = frozenset({ReportType.LAB})

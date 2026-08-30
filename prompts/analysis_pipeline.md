@@ -5,7 +5,7 @@ description: Owns the upload->report flow. Calls the screener, then the extracto
 model_call: none
 includes: []
 tools: [sanity_bounds, name_match]
-subagents: [screener, extractor, auditor, verifier]
+subagents: [screener, transcriber, extractor, auditor, verifier]
 output: report
 trajectory_kind: none
 ---

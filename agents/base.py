@@ -7,6 +7,7 @@
   That table is the audit trail when a report looks wrong;
 - deterministic generation (temperature 0) so the same document yields the same result.
 """
+import asyncio
 import base64
 import logging
 import time
@@ -17,7 +18,8 @@ import httpx
 
 from agents.tools import TOOLS
 from app.config import settings
-from app.constants import GEMINI_CALL_TIMEOUT_SECS, MODEL_COOLDOWN_SECS
+from app.constants import (GEMINI_CALL_TIMEOUT_SECS, GEMINI_THINKING_LEVEL, MODEL_COOLDOWN_SECS,
+                           MODEL_RETRY_BACKOFF_SECS, MODEL_RETRY_ROUNDS)
 from app.enums import TrajectoryKind
 from db import session as db
 
@@ -72,36 +74,42 @@ class ModelClient:
         body = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
+            "generationConfig": {"response_mime_type": "application/json", "temperature": 0,
+                                 "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL}},
         }
         request_log = {"user_text": user_text, "files": files_meta, "attempts": []}
         started = time.monotonic()
         last_err: Exception | None = None
 
-        for model in model_order(self._models, self._failed_at, time.monotonic()):
-            try:
-                async with httpx.AsyncClient(timeout=GEMINI_CALL_TIMEOUT_SECS) as client:
-                    resp = await client.post(GEMINI_ENDPOINT.format(model=model), json=body,
-                                             headers={"x-goog-api-key": self._api_key})
-                resp.raise_for_status()
-                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception as e:
-                # Provider fault: cool this model down and try the next one.
-                self._failed_at[model] = time.monotonic()
-                last_err = e
-                request_log["attempts"].append({"model": model, "error": f"{type(e).__name__}: {e}"[:300]})
-                logger.warning("model %s failed (%s: %s); trying next", model, type(e).__name__, e)
-                continue
-            self._failed_at.pop(model, None)
-            try:
-                parsed = _json_extract(text)
-            except ValueError as e:
-                # The model answered; the reply was unusable. Not a reason to blame the
-                # model or to retry elsewhere - the document is what it is.
-                await self._log(meta, request_log, model, text, "bad_reply", str(e), started)
-                raise BadModelReply(str(e)) from e
-            await self._log(meta, request_log, model, text, "ok", None, started)
-            return parsed
+        # A 503 "high demand" is transient by Google's own wording, so sweep the models
+        # more than once before declaring the provider unavailable.
+        for round_no in range(MODEL_RETRY_ROUNDS):
+            if round_no:
+                await asyncio.sleep(MODEL_RETRY_BACKOFF_SECS * round_no)
+            for model in model_order(self._models, self._failed_at, time.monotonic()):
+                try:
+                    async with httpx.AsyncClient(timeout=GEMINI_CALL_TIMEOUT_SECS) as client:
+                        resp = await client.post(GEMINI_ENDPOINT.format(model=model), json=body,
+                                                 headers={"x-goog-api-key": self._api_key})
+                    resp.raise_for_status()
+                    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception as e:
+                    # Provider fault: cool this model down and try the next one.
+                    self._failed_at[model] = time.monotonic()
+                    last_err = e
+                    request_log["attempts"].append({"model": model, "error": f"{type(e).__name__}: {e}"[:300]})
+                    logger.warning("model %s failed (%s: %s); trying next", model, type(e).__name__, e)
+                    continue
+                self._failed_at.pop(model, None)
+                try:
+                    parsed = _json_extract(text)
+                except ValueError as e:
+                    # The model answered; the reply was unusable. Not a reason to blame the
+                    # model or to retry elsewhere - the document is what it is.
+                    await self._log(meta, request_log, model, text, "bad_reply", str(e), started)
+                    raise BadModelReply(str(e)) from e
+                await self._log(meta, request_log, model, text, "ok", None, started)
+                return parsed
 
         await self._log(meta, request_log, None, None, "error",
                         str(last_err)[:500] if last_err else "no models configured", started)

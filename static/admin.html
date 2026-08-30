@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Folin Admin</title>
+<style>
+  /* Spacing and radii follow the product's golden-ratio scale: 8 / 13 / 21 / 34 / 55. */
+  :root{
+    --bg:#f4f4f5; --surface:#fcfcfb; --raised:#fff; --ink:#0b0b0b; --muted:#52514e;
+    --line:#e4e4e7; --brand:#ea580c;
+    /* Status. Validated on both surfaces for deuteran/protan/tritan separation -
+       green/red failed CVD at deltaE 4.1, so "analysed" is blue, not green. */
+    --ok:#2a78d6; --bad:#d03b3b; --warn:#b45309; --good:#0ca30c;
+    --s8:8px; --s13:13px; --s21:21px; --s34:34px; --s55:55px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0b0b0b; --surface:#1a1a19; --raised:#211f1e; --ink:#fff; --muted:#c3c2b7;
+           --line:#2f2d2b; --ok:#3987e5; --bad:#e05252; --warn:#fbbf24; --good:#4ade80; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;
+       font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;gap:var(--s13);align-items:center;flex-wrap:wrap;
+         padding:var(--s13) var(--s21);border-bottom:1px solid var(--line);
+         background:var(--surface);position:sticky;top:0;z-index:20}
+  h1{font-size:18px;margin:0;letter-spacing:-.02em;font-weight:700}
+  h1 span{color:var(--brand)}
+  .spacer{flex:1}
+  main{padding:var(--s21);max-width:1320px;margin:0 auto}
+  section{margin-bottom:var(--s21)}
+  h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+     margin:0 0 var(--s13);font-weight:600}
+  .grid{display:grid;gap:var(--s13);grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+  .two{display:grid;gap:var(--s13);grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--s13);
+        padding:var(--s21)}
+  .kpi{font-size:34px;font-weight:680;letter-spacing:-.03em;line-height:1.1;
+       font-variant-numeric:tabular-nums}
+  .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;
+         font-weight:600}
+  .sub{font-size:12px;color:var(--muted)}
+  .row{display:flex;align-items:baseline;gap:var(--s8);flex-wrap:wrap;margin-top:6px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:var(--s8) var(--s13);border-bottom:1px solid var(--line)}
+  tr:last-child td{border-bottom:0}
+  th{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  .scroll{overflow-x:auto}
+  .pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
+        font-size:12px;font-weight:650;white-space:nowrap}
+  .p-ok{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good)}
+  .p-warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+  .p-bad{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+  .p-flat{background:color-mix(in srgb,var(--muted) 14%,transparent);color:var(--muted)}
+  button,select,input{font:inherit;border:1px solid var(--line);background:var(--raised);
+    color:var(--ink);border-radius:var(--s8);padding:7px var(--s13)}
+  button{cursor:pointer;font-weight:600}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  #gate{max-width:520px;margin:var(--s55) auto}
+  #gate input{width:100%;margin:var(--s13) 0}
+  .err{color:var(--bad);font-size:14px;margin-top:var(--s13)}
+  .bar{height:6px;border-radius:999px;background:var(--line);overflow:hidden;margin-top:6px}
+  .bar>i{display:block;height:100%;background:var(--brand);border-radius:999px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .hide{display:none}
+  .chartwrap{position:relative}
+  svg.chart{display:block;max-width:100%}
+  .gridline{stroke:var(--line);stroke-width:1}
+  .axis{fill:var(--muted);font-size:11px}
+  .hit{fill:transparent;cursor:pointer}
+  .hit:hover{fill:var(--line);fill-opacity:.35}
+  .legend{display:flex;gap:var(--s13);flex-wrap:wrap;margin-bottom:var(--s13)}
+  .key{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+  .swatch{width:11px;height:11px;border-radius:3px;display:inline-block}
+  #tip{position:absolute;pointer-events:none;background:var(--raised);color:var(--ink);
+       border:1px solid var(--line);border-radius:var(--s8);padding:var(--s8) var(--s13);
+       font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.16);opacity:0;transition:opacity .1s;
+       z-index:30;white-space:nowrap;left:0;top:0}
+  .skeleton{height:104px;border-radius:var(--s13);background:var(--line);opacity:.45;
+            animation:pulse 1.2s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.2}}
+  @media (prefers-reduced-motion:reduce){.skeleton{animation:none}}
+</style>
+</head>
+<body>
+
+<div id="gate" class="card">
+  <h1>folin <span>admin</span></h1>
+  <div style="display:flex;gap:var(--s8);margin:var(--s13) 0">
+    <button id="tabTok" class="primary" onclick="showTab('tok')">Paste token</button>
+    <button id="tabPw" onclick="showTab('pw')">Email &amp; password</button>
+  </div>
+  <div id="paneTok">
+    <p class="sub">A Google account has no password. Generate a token:<br>
+      <span class="mono">./venv/bin/python scripts/admin_token.py you@gmail.com</span></p>
+    <input id="token" type="password" placeholder="Access token" autocomplete="off"
+           onkeydown="if(event.key==='Enter')saveToken()">
+    <button class="primary" onclick="saveToken()">Open dashboard</button>
+  </div>
+  <div id="panePw" class="hide">
+    <p class="sub">For an admin account that has a password.</p>
+    <input id="email" type="email" placeholder="you@example.com" autocomplete="username">
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password"
+           onkeydown="if(event.key==='Enter')signIn()">
+    <button class="primary" onclick="signIn()">Sign in</button>
+  </div>
+  <div id="gateErr" class="err"></div>
+</div>
+
+<div id="app" class="hide">
+  <header>
+    <h1>folin <span>admin</span></h1>
+    <select id="window" onchange="load()" aria-label="Time window"></select>
+    <button onclick="load()">Refresh</button>
+    <label class="sub" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="auto" style="width:auto;margin:0" onchange="setAuto()"> auto
+    </label>
+    <div class="spacer"></div>
+    <span id="stamp" class="sub"></span>
+    <button onclick="signOut()">Sign out</button>
+  </header>
+  <main id="body"><div class="grid">
+    <div class="skeleton"></div><div class="skeleton"></div>
+    <div class="skeleton"></div><div class="skeleton"></div>
+  </div></main>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+const KEY = "folin_admin_token";
+// The page is served at <prefix>/admin, so strip that to recover the prefix. A bare
+// relative fetch resolves against <prefix>/ and silently misses the admin segment.
+const BASE = location.pathname.replace(/\/admin\/?$/, "");
+const AUTO_MS = 60000;
+let token = "", timer = null, lastSeries = null;
+addEventListener("resize", () => { if (lastSeries) drawChart(lastSeries); });
+try { token = localStorage.getItem(KEY) || ""; } catch (e) {}
+
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const num = (v) => Number(v ?? 0).toLocaleString();
+const inr = (v) => "₹" + num(v);
+const ms = (v) => v >= 1000 ? (v / 1000).toFixed(1) + "s" : Math.round(v) + "ms";
+
+function showTab(which){
+  const tok = which === "tok";
+  $("paneTok").classList.toggle("hide", !tok);
+  $("panePw").classList.toggle("hide", tok);
+  $("tabTok").className = tok ? "primary" : "";
+  $("tabPw").className = tok ? "" : "primary";
+  $("gateErr").textContent = "";
+}
+function saveToken(){
+  const v = $("token").value.trim();
+  if (!v) { $("gateErr").textContent = "Enter a token."; return; }
+  token = v.replace(/^Bearer\s+/i, "");
+  try { localStorage.setItem(KEY, token); } catch (e) {}
+  load();
+}
+async function signIn(){
+  const identifier = $("email").value.trim(), password = $("password").value;
+  if (!identifier || !password) { $("gateErr").textContent = "Enter both fields."; return; }
+  try {
+    const res = await fetch(`${BASE}/auth/login`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({identifier, password})});
+    if (!res.ok) {
+      $("gateErr").textContent = res.status === 401 ? "Wrong email or password."
+                                                    : "Sign-in failed (HTTP " + res.status + ").";
+      return;
+    }
+    token = (await res.json()).access_token;
+    try { localStorage.setItem(KEY, token); } catch (e) {}
+    $("password").value = "";
+    load();
+  } catch (e) { $("gateErr").textContent = "Could not reach the server: " + e.message; }
+}
+function signOut(){
+  token = ""; clearInterval(timer); timer = null;
+  try { localStorage.removeItem(KEY); } catch (e) {}
+  $("app").classList.add("hide"); $("gate").classList.remove("hide");
+}
+function setAuto(){
+  clearInterval(timer);
+  timer = $("auto").checked ? setInterval(load, AUTO_MS) : null;
+}
+
+function delta(d){
+  if (!d || d.change === null || d.change === undefined)
+    return `<span class="pill p-flat">no baseline</span>`;
+  const up = d.change > 0, flat = d.change === 0;
+  const cls = flat ? "p-flat" : up ? "p-ok" : "p-bad";
+  return `<span class="pill ${cls}">${flat ? "±" : up ? "▲" : "▼"} ${Math.abs(d.change)}%</span>`;
+}
+function rateClass(p){ return p >= 95 ? "p-ok" : p >= 80 ? "p-warn" : "p-bad"; }
+
+function kpi(label, value, extra, sub){
+  return `<div class="card"><div class="label">${esc(label)}</div>
+    <div class="kpi">${value}</div>
+    <div class="row">${extra || ""}${sub ? `<span class="sub">${sub}</span>` : ""}</div></div>`;
+}
+
+function table(cols, rows, render, empty){
+  if (!rows.length) return `<div class="card"><div class="sub">${esc(empty || "Nothing in this window.")}</div></div>`;
+  const head = cols.map(c => `<th class="${c.num ? "num" : ""}">${esc(c.label)}</th>`).join("");
+  return `<div class="card scroll" style="padding:var(--s8)"><table><thead><tr>${head}</tr></thead>
+    <tbody>${rows.map(r => `<tr>${render(r)}</tr>`).join("")}</tbody></table></div>`;
+}
+
+function share(rows, key){
+  if (!rows.length) return `<tr><td class="sub">No data</td></tr>`;
+  const total = rows.reduce((s, r) => s + Number(r.n || 0), 0) || 1;
+  return rows.map(r => {
+    const pct = Math.round(Number(r.n || 0) * 100 / total);
+    return `<tr><td>${esc(r[key] ?? "—")}</td><td class="num">${num(r.n)}</td>
+      <td style="width:50%"><div class="bar"><i style="width:${pct}%"></i></div></td>
+      <td class="num sub">${pct}%</td></tr>`;
+  }).join("");
+}
+
+/* Uploads per day, split by outcome. Stacked bars: magnitude over discrete days, with
+   the split answering "how much of that volume failed" inside the same mark. Two series,
+   so a legend is always present and the tooltip names both - identity is never colour alone.
+
+   Drawn in real pixels measured from the container: a fixed viewBox with uniform scaling
+   letter-boxes the plot into the middle of a wide card and shrinks the type with it. */
+const CHART_H = 220, PAD = {t: 10, r: 8, b: 22, l: 30};
+
+function drawChart(series){
+  const host = document.getElementById("chart");
+  if (!host) return;
+  const W = Math.max(320, host.clientWidth), H = CHART_H;
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+  const max = Math.max(1, ...series.map(d => d.uploads));
+  const n = series.length, slot = plotW / n;
+  const bw = Math.min(slot * 0.58, 34), GAP = 2;
+  const y = (v) => PAD.t + plotH * (1 - v / max);
+  const ticks = [...new Set([0, Math.round(max / 2), max])];
+
+  const grid = ticks.map(t => `
+    <line class="gridline" x1="${PAD.l}" x2="${W - PAD.r}" y1="${y(t)}" y2="${y(t)}"/>
+    <text class="axis" x="${PAD.l - 6}" y="${y(t) + 3}" text-anchor="end">${t}</text>`).join("");
+
+  const step = Math.ceil(n / 12);
+  const bars = series.map((d, i) => {
+    const cx = PAD.l + slot * i + slot / 2, x = cx - bw / 2;
+    const hOk = d.ok ? plotH * d.ok / max : 0;
+    const hBad = d.failed ? plotH * d.failed / max : 0;
+    const yBad = PAD.t + plotH - hBad;
+    const yOk = yBad - hOk - (hOk && hBad ? GAP : 0);
+    const r = Math.min(4, bw / 3);
+    const seg = (yy, hh, fill) => hh <= 0 ? "" :
+      `<rect x="${x}" y="${yy}" width="${bw}" height="${Math.max(hh, 2)}" rx="${r}" fill="${fill}"/>`;
+    const label = new Date(d.day + "T00:00:00Z").toLocaleDateString(undefined,
+      {month: "short", day: "numeric", timeZone: "UTC"});
+    const tip = `${label} · ${d.uploads} upload${d.uploads === 1 ? "" : "s"} · `
+              + `${d.ok} analysed · ${d.failed} failed · ${d.signups} signup${d.signups === 1 ? "" : "s"}`;
+    return `<g>
+      <rect class="hit" x="${PAD.l + slot * i}" y="${PAD.t}" width="${slot}" height="${plotH}"
+            rx="4" data-tip="${esc(tip)}"/>
+      ${seg(yBad, hBad, "var(--bad)")}${seg(yOk, hOk, "var(--ok)")}
+      ${i % step === 0 ? `<text class="axis" x="${cx}" y="${H - 6}" text-anchor="middle">${esc(label)}</text>` : ""}
+    </g>`;
+  }).join("");
+
+  host.innerHTML = `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"
+      role="img" aria-label="Uploads per day, split into analysed and failed">
+      ${grid}${bars}</svg>`;
+  wireTips();
+}
+
+function chartShell(){
+  return `<div class="legend">
+      <span class="key"><i class="swatch" style="background:var(--ok)"></i> Analysed</span>
+      <span class="key"><i class="swatch" style="background:var(--bad)"></i> Failed</span>
+    </div>
+    <div class="chartwrap" id="chart"></div>`;
+}
+
+function wireTips(){
+  const tip = $("tip");
+  document.querySelectorAll(".hit").forEach(el => {
+    el.addEventListener("mousemove", (e) => {
+      tip.textContent = el.dataset.tip;
+      tip.style.opacity = "1";
+      const pad = 14;
+      tip.style.left = Math.max(4, Math.min(e.pageX + pad,
+        scrollX + innerWidth - tip.offsetWidth - pad)) + "px";
+      tip.style.top = Math.max(4, e.pageY - tip.offsetHeight - pad) + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.opacity = "0"; });
+  });
+}
+
+function render(d){
+  const win = $("window").value, w = d.overview[win] || {}, j = d.jobs, m = d.models;
+  const real = m.by_model.filter(r => r.model !== "none");
+  const worst = real.length ? real.reduce((a, r) => a.ok_rate <= r.ok_rate ? a : r) : null;
+  const health = w.success_rate >= 95 ? "healthy" : w.success_rate >= 80 ? "degraded" : "failing";
+
+  const head = `<section><div class="grid">
+    ${kpi("Uploads", num(w.uploads), delta(d.deltas.uploads), `${num(w.jobs_ok)} analysed`)}
+    ${kpi("Success rate", w.success_rate + "%",
+          `<span class="pill ${rateClass(w.success_rate)}">${health}</span>`,
+          `p50 ${j.duration.p50_s}s · p95 ${j.duration.p95_s}s`)}
+    ${kpi("Signups", num(w.signups), delta(d.deltas.signups), `${num(d.totals.users)} total`)}
+    ${kpi("Revenue", inr(w.revenue_inr), delta(d.deltas.revenue), `${d.payments.conversion}% of orders paid`)}
+  </div></section>`;
+
+  const trend = `<section><h2>Uploads per day</h2>
+    <div class="card">${chartShell()}</div></section>`;
+
+  const modelHealth = `<section><h2>Model health</h2>
+    ${table([{label:"Model"},{label:"Calls",num:1},{label:"OK",num:1},{label:"Bad reply",num:1},
+             {label:"Errors",num:1},{label:"p50",num:1},{label:"p95",num:1}],
+      m.by_model, r => `
+      <td class="mono">${esc(r.model === "none" ? "— all models failed —" : r.model)}</td>
+      <td class="num">${num(r.calls)}</td>
+      <td class="num"><span class="pill ${rateClass(r.ok_rate)}">${r.ok_rate}%</span></td>
+      <td class="num">${num(r.bad_reply)}</td>
+      <td class="num">${num(r.errors)}</td>
+      <td class="num sub">${ms(r.p50_ms)}</td>
+      <td class="num sub">${ms(r.p95_ms)}</td>`,
+      "No model calls in this window.")}
+    ${worst && worst.ok_rate < 100 ? `<div class="sub" style="margin-top:var(--s8)">
+      Weakest model: <b>${esc(worst.model)}</b> at ${worst.ok_rate}% OK.</div>` : ""}
+  </section>`;
+
+  const twoUp = `<section><div class="two">
+    <div><h2>Why uploads failed</h2>
+      ${table([{label:"Error"},{label:"Count",num:1}], j.top_errors,
+        r => `<td>${esc(r.error)}</td><td class="num">${num(r.n)}</td>`,
+        "No failures in this window.")}</div>
+    <div><h2>Latency by stage</h2>
+      ${table([{label:"Stage"},{label:"Calls",num:1},{label:"p50",num:1}], m.by_kind,
+        r => `<td class="mono">${esc(r.kind)}</td><td class="num">${num(r.calls)}</td>
+              <td class="num sub">${ms(r.p50_ms)}</td>`)}</div>
+  </div></section>`;
+
+  const breakdown = `<section><h2>Breakdown</h2><div class="two">
+    ${[["Job status", j.by_status, "status"], ["Report type", d.reports.by_type, "report_type"],
+       ["Sign-in method", d.users.by_provider, "auth_provider"], ["Plan", d.users.by_plan, "plan"]]
+      .map(([t, rows, k]) => `<div class="card" style="padding:var(--s13)">
+        <div class="label" style="margin-bottom:var(--s8)">${t}</div>
+        <table><tbody>${share(rows, k)}</tbody></table></div>`).join("")}
+  </div></section>`;
+
+  const quality = `<section><h2>Data quality</h2><div class="grid">
+    ${kpi("Name mismatch", num(d.reports.flags.name_mismatch), "", "uploaded to another profile")}
+    ${kpi("Reports, no markers", num(d.reports.flags.no_markers), "", "possible extraction miss")}
+    ${kpi("Avg health score", num(d.totals.avg_score), "", `across ${num(d.totals.reports)} reports`)}
+    ${kpi("Members", num(d.totals.members), "", "family sub-profiles")}
+  </div></section>`;
+
+  const recent = `<section><h2>Recent jobs</h2>
+    ${table([{label:"Job"},{label:"Status"},{label:"When"},{label:"Detail"}], j.recent, r => `
+      <td class="mono">${esc(r.job_id)}</td>
+      <td><span class="pill ${r.status === "success" ? "p-ok" : r.status === "error" ? "p-bad" : "p-warn"}">${esc(r.status)}</span></td>
+      <td class="sub">${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</td>
+      <td class="sub">${esc(r.error || "—")}</td>`)}
+  </section>`;
+
+  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent;
+  $("stamp").textContent = "updated " + new Date(d.generated_at).toLocaleTimeString();
+  drawChart(d.timeseries);
+  lastSeries = d.timeseries;
+  wireTips();
+}
+
+async function load(){
+  if (!token) { $("gate").classList.remove("hide"); $("app").classList.add("hide"); return; }
+  const sel = $("window"), win = sel.value || "7d";
+  try {
+    const res = await fetch(`${BASE}/admin/metrics?window=${encodeURIComponent(win)}`,
+                            {headers: {Authorization: "Bearer " + token}});
+    if (res.status === 401 || res.status === 404) {
+      signOut();
+      $("gateErr").textContent = res.status === 404
+        ? "That account is not on the admin list." : "Token expired or invalid.";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    if (!sel.options.length)
+      sel.innerHTML = d.windows.map(x => `<option${x === win ? " selected" : ""}>${x}</option>`).join("");
+    $("gate").classList.add("hide"); $("app").classList.remove("hide");
+    render(d);
+  } catch (e) {
+    $("gateErr").textContent = "Could not load metrics: " + e.message;
+    $("gate").classList.remove("hide");
+  }
+}
+
+load();
+</script>
+</body>
+</html>

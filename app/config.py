@@ -81,6 +81,7 @@ class Settings:
     smtp_from: str
     # --- network
     cors_allowed_origins: list[str]
+    admin_emails: list[str]
     trusted_proxy_ips: frozenset[str] = field(default_factory=frozenset)
 
     @property
@@ -131,6 +132,7 @@ def _load() -> Settings:
         pro_term_days=_int("PRO_TERM_DAYS"),
         pro_price_inr=_int("PRO_PRICE_INR"),
         allow_self_serve_pro=_bool("ALLOW_SELF_SERVE_PRO"),
+        admin_emails=[e.lower() for e in _csv("ADMIN_EMAILS", required=False)],
         razorpay_key_id=_req("RAZORPAY_KEY_ID"),
         razorpay_key_secret=_req("RAZORPAY_KEY_SECRET"),
         resend_api_key=resend_key,
