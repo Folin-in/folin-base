@@ -12,6 +12,12 @@ cp .env.example .env   # fill required values; optional settings and defaults ar
 
 Schema is applied idempotently from `db/schema/*.sql` at startup.
 
+The API also runs a durable retest-reminder worker. Authenticated native clients register
+Expo push tokens at `/api/user/push-token`; Pro users receive privacy-safe reminders at
+09:00 or later in their device timezone, at the Daily/Weekly cadence selected in Settings.
+Expo delivery tickets and receipts are persisted so retries are deduplicated across API
+workers. Set `EXPO_ACCESS_TOKEN` only when enhanced push security is enabled in EAS.
+
 ## Verify
 
 ```bash

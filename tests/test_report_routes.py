@@ -7,12 +7,14 @@ must still parse, authorise, call, and shape its response the same way.
 import asyncio
 import base64
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 import services.analysis as A
 import services.jobs as J
+import services.push_notifications as P
 from app.main import app
 from core import rate_limit
 from db import session as db
@@ -152,6 +154,45 @@ def test_pending_job_can_be_claimed_and_recovered():
         row = await db.fetchrow(
             "select status, report_id, request_payload from analyze_jobs where job_id = $1", job_id)
         assert row["status"] == "success" and row["report_id"] and row["request_payload"] is None
+        await cleanup(email)
+    run(t)
+
+
+def test_push_token_registration_and_due_reminder_are_deduplicated(monkeypatch):
+    sent_tokens = []
+
+    async def fake_send(token, delivery_id):
+        sent_tokens.append(token["token"])
+        await db.execute(
+            "update push_deliveries set status = 'delivered', receipt_checked_at = now() where id = $1",
+            delivery_id,
+        )
+        return True
+
+    monkeypatch.setattr(P.push_notifications, "_send", fake_send)
+
+    async def t(c):
+        h, email = await user(c, plan="pro")
+        token = f"ExponentPushToken[{uuid.uuid4().hex}]"
+        bad = await c.post("/api/user/push-token", headers=h, json={
+            "token": token, "platform": "android", "timezone": "Not/A_Real_Zone",
+        })
+        assert bad.status_code == 400
+        registered = await c.post("/api/user/push-token", headers=h, json={
+            "token": token, "platform": "android", "timezone": "Asia/Kolkata",
+        })
+        assert registered.status_code == 200 and registered.json() == {"registered": True}
+
+        await upload(c, h, lab(date="2026-03-01"))
+        # 09:30 in Asia/Kolkata: eligible for the 09:00 local delivery window.
+        now = datetime(2026, 8, 30, 4, 0, tzinfo=timezone.utc)
+        assert await P.push_notifications.run_once(now) == 1
+        assert await P.push_notifications.run_once(now) == 0
+        assert sent_tokens == [token]
+
+        removed = await c.request("DELETE", "/api/user/push-token", headers=h, json={"token": token})
+        assert removed.status_code == 200 and removed.json() == {"registered": False}
+        assert not await db.fetchval("select active from push_tokens where token = $1", token)
         await cleanup(email)
     run(t)
 

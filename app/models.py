@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -96,6 +96,18 @@ class PreferencesUpdate(BaseModel):
     notifications: Optional[str] = None
     units: Optional[str] = None
     region: Optional[str] = None
+
+
+class PushTokenRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256,
+                       pattern=r"^(Exponent|Expo)PushToken\[[A-Za-z0-9_-]+\]$")
+    platform: Literal["android", "ios"]
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+
+class PushTokenDeleteRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256,
+                       pattern=r"^(Exponent|Expo)PushToken\[[A-Za-z0-9_-]+\]$")
 
 
 PLANS = {"free", "pro"}

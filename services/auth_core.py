@@ -150,6 +150,11 @@ class AuthCore:
     @staticmethod
     async def logout(user: dict) -> None:
         await db.execute("update users set token_version = token_version + 1 where user_id = $1", user["user_id"])
+        # Logout revokes every session for this account, so its device notification
+        # registrations must also stop. This prevents reminders appearing on a shared
+        # phone after its owner has signed out.
+        await db.execute("update push_tokens set active = false, updated_at = now() where user_id = $1",
+                         user["user_id"])
         cache.invalidate(user["user_id"])
         await revoke_all_refresh_tokens(user["user_id"])
 

@@ -2,9 +2,10 @@
 from fastapi import APIRouter, Depends
 
 from app.models import (ChangeEmailRequest, ChangePasswordRequest, HealthProfileUpdate, PlanChangeRequest,
-                        PreferencesUpdate)
+                        PreferencesUpdate, PushTokenDeleteRequest, PushTokenRequest)
 from core.security import get_current_user
 from services.users import users
+from services.push_notifications import push_notifications
 
 router = APIRouter(tags=["users"])
 
@@ -38,6 +39,18 @@ async def get_preferences(current_user: dict = Depends(get_current_user)):
 @router.put("/user/preferences")
 async def update_preferences(req: PreferencesUpdate, current_user: dict = Depends(get_current_user)):
     return await users.update_preferences(req, current_user)
+
+
+@router.post("/user/push-token")
+async def register_push_token(req: PushTokenRequest, current_user: dict = Depends(get_current_user)):
+    await push_notifications.register(req, current_user["user_id"])
+    return {"registered": True}
+
+
+@router.delete("/user/push-token")
+async def unregister_push_token(req: PushTokenDeleteRequest, current_user: dict = Depends(get_current_user)):
+    await push_notifications.unregister(req.token, current_user["user_id"])
+    return {"registered": False}
 
 
 @router.post("/user/change-password")

@@ -9,6 +9,7 @@ from app.config import settings
 from db import session as database
 from routers import admin, auth, family, members, payments, reports, users
 from services.jobs import jobs
+from services.push_notifications import push_notifications
 
 API_PREFIX = "/api"
 API_TITLE = "Folin API"
@@ -22,9 +23,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     await database.connect()
     await jobs.start()
+    await push_notifications.start()
     try:
         yield
     finally:
+        await push_notifications.stop()
         await jobs.stop()
         await database.close()
 

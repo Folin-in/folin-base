@@ -19,6 +19,9 @@ MAX_UPLOAD_BASE64_BYTES = 14 * 1024 * 1024  # ~10 MB decoded; reject before deco
 ANALYZE_JOB_TIMEOUT_SECS = 540
 ANALYZE_JOB_GRACE_SECS = 30               # a 'processing' row older than timeout+grace is dead
 ANALYZE_WORKER_POLL_SECS = 2              # picks up jobs enqueued by another API worker
+PUSH_WORKER_POLL_SECS = 15 * 60           # notification scan / transient retry cadence
+PUSH_RECEIPT_DELAY_SECS = 15 * 60         # Expo recommends checking receipts after 15m
+PUSH_SEND_LOCAL_HOUR = 9                  # never send a reminder before 09:00 device-local
 # A healthy extractor call on a 14-page scan measures ~33s once thinking is bounded, so a
 # call still open at 120s is queued behind free-tier congestion, not working. Fail over
 # fast instead: the retry rounds below only help if each attempt is cheap.
