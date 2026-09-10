@@ -1,10 +1,11 @@
 """Report routes. Thin: parse the request, call the service, return its result."""
 from fastapi import APIRouter, Depends, Query
 
+from app.constants import ANALYZE_JOB_TIMEOUT_SECS
 from app.models import AnalyzeRequest, BiomarkerPatch, ReportFeedbackIn, ReportTitleUpdate
 from core.security import get_current_user
 from services.compare import compare
-from services.jobs import jobs
+from services.jobs import jobs, remaining_seconds
 from services.reports import reports
 from services.tips import tips
 
@@ -20,14 +21,18 @@ async def active_analyze_job(current_user: dict = Depends(get_current_user)):
     if not job:
         return {"active": False}
     return {"active": True, "job_id": job["job_id"], "status": job["status"],
-            "filename": job["filename"], "created_at": job["created_at"]}
+            "filename": job["filename"], "created_at": job["created_at"],
+            "timeout_seconds": ANALYZE_JOB_TIMEOUT_SECS,
+            "remaining_seconds": remaining_seconds(job["created_at"])}
 
 
 @router.post("/analyze")
 async def analyze_report(req: AnalyzeRequest, current_user: dict = Depends(get_current_user)):
     """Enqueue an analysis; poll /analyze/status/{job_id} until success or error."""
     q = await jobs.enqueue(req, current_user)
-    return {"job_id": q.job_id, "status": q.status}
+    return {"job_id": q.job_id, "status": q.status, "created_at": q.created_at,
+            "timeout_seconds": ANALYZE_JOB_TIMEOUT_SECS,
+            "remaining_seconds": remaining_seconds(q.created_at)}
 
 
 @router.get("/analyze/status/{job_id}")

@@ -1,3 +1,5 @@
+-- Legacy Razorpay payment records are retained for financial reporting and migration.
+-- New Android purchases use google_play_subscriptions.
 create table if not exists payments (
   order_id text primary key,       -- razorpay order id
   user_id text not null,

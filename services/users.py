@@ -267,8 +267,18 @@ class UserService:
         """Hard delete. Stored files first (storage_path is comma-joined for multi-page uploads),
         then the users row - FK cascades take out reports, members, tokens, resets, jobs,
         quotas and family rows. This is the privacy-policy promise."""
+        # Account deletion must not leave a paid renewal running with no Folin account
+        # to receive it. This stops the next charge; it does not issue a refund.
+        from services.payments import payments
+
+        await payments.cancel_for_account_deletion(user_id)
         rows = await db.fetch("select storage_path from reports where user_id = $1 and storage_path is not null", user_id)
         await storage.delete_files([p for r in rows for p in r["storage_path"].split(",") if p])
+        # Billing rows intentionally have no user FK because Play notifications may
+        # arrive after deletion. Remove the account binding and purchase token here so
+        # a deleted Folin identity cannot be reconstructed from subscription metadata.
+        await db.execute("delete from google_play_account_links where user_id = $1", user_id)
+        await db.execute("delete from google_play_subscriptions where user_id = $1", user_id)
         await db.execute("delete from users where user_id = $1", user_id)
         cache.invalidate(user_id)
         cache.invalidate_reports(user_id)

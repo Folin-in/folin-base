@@ -220,6 +220,10 @@ def test_verifier_failure_is_non_fatal():
         p = pipeline_with(ACCEPT, GOOD_LAB, ModelUnavailable("503"))
         res = await p.run(files(1), uid, user, None)
         assert res.report_id, "a verifier outage must not lose the report"
+        assert all(b["needs_verification"] for b in res.report["biomarkers"])
+        meta = await db.fetchval("select analysis_meta from reports where id = $1::uuid", res.report_id)
+        assert meta["verification_status"] == "unavailable"
+        assert set(meta["stage_seconds"]) == {"screen", "transcribe", "analyze", "verify"}
         await cleanup(email)
     run(t)
 

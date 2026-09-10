@@ -25,6 +25,16 @@ def _resend_configured() -> bool:
     return _RESEND_AVAILABLE and bool(settings.resend_api_key)
 
 
+def verify_resend_webhook(payload: str, headers: dict[str, str]) -> dict:
+    if not _RESEND_AVAILABLE or not settings.resend_webhook_secret:
+        raise RuntimeError("Resend webhook verification is not configured")
+    return resend.Webhooks.verify({  # type: ignore
+        "payload": payload,
+        "headers": headers,
+        "webhook_secret": settings.resend_webhook_secret,
+    })
+
+
 if _resend_configured():
     resend.api_key = settings.resend_api_key  # type: ignore
 
@@ -78,6 +88,52 @@ def send_family_invite(inviter_name: str, invitee_email: str, relationship: str 
         return email_id
     except Exception as e:
         logger.warning(f"[email] Failed to send invite to {invitee_email}: {e}")
+        return None
+
+
+async def send_early_access_confirmation(to_email: str, confirm_url: str) -> Optional[str]:
+    """Send the fixed double-opt-in email for the public website waitlist."""
+    if not _resend_configured() or not settings.early_access_from:
+        logger.warning("[email] Resend is not configured for early-access confirmation")
+        return None
+
+    safe_url = _html.escape(confirm_url, quote=True)
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+      <body style="font-family:Arial,sans-serif;background:#F4F4F6;padding:24px;margin:0;">
+        <div style="max-width:520px;margin:0 auto;background:#FFFFFF;border-radius:20px;padding:32px 28px;">
+          <div style="display:inline-block;background:#FDE4CE;color:#B04B0F;font-weight:800;padding:10px 14px;border-radius:16px;font-size:18px;">Folin</div>
+          <h1 style="font-size:22px;color:#17181A;margin:24px 0 8px;letter-spacing:-0.4px;">Confirm early access</h1>
+          <p style="font-size:14px;color:#5A5F6A;line-height:22px;margin:0 0 20px;">Confirm that you want product updates and an invitation when Folin early access opens.</p>
+          <div style="text-align:center;margin:28px 0 20px;">
+            <a href="{safe_url}" style="display:inline-block;background:#F1580C;color:#FFFFFF;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:999px;font-size:15px;">Confirm early access</a>
+          </div>
+          <p style="font-size:12px;color:#777D87;line-height:18px;margin:0;">This link expires in {settings.early_access_confirmation_expire_hours} hours. If you did not request this, ignore this email and we will not add you.</p>
+        </div>
+      </body>
+    </html>
+    """
+    text = (
+        "Confirm your Folin early-access request:\n\n"
+        f"{confirm_url}\n\n"
+        f"This link expires in {settings.early_access_confirmation_expire_hours} hours. "
+        "If you did not request this, ignore this email."
+    )
+    try:
+        resp = await resend.Emails.send_async({  # type: ignore
+            "from": settings.early_access_from,
+            "to": [to_email],
+            "subject": "Confirm your Folin early access",
+            "html": html,
+            "text": text,
+            "tags": [{"name": "flow", "value": "early-access"}],
+        })
+        email_id = (resp or {}).get("id") if isinstance(resp, dict) else getattr(resp, "id", None)
+        logger.info("[email] Early-access confirmation accepted by Resend · id=%s", email_id)
+        return email_id
+    except Exception as exc:
+        logger.warning("[email] Early-access confirmation failed: %s", exc)
         return None
 
 

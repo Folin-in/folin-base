@@ -148,6 +148,14 @@ class FamilyInviteRequest(BaseModel):
     relationship: str = Field(default="family", max_length=20)
 
 
+# ---------- Web early access ----------
+class EarlyAccessRequest(BaseModel):
+    email: EmailStr
+    turnstile_token: str = Field(min_length=1, max_length=2048)
+    # Hidden field. Real users leave it empty; simple form bots commonly fill it.
+    website: str = Field(default="", max_length=200)
+
+
 # ---------- Reports ----------
 class Biomarker(BaseModel):
     name: str
@@ -293,7 +301,14 @@ class SupabaseSyncRequest(BaseModel):
     consent: bool = False
 
 
-class RazorpayVerifyRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+class GooglePlayVerifyRequest(BaseModel):
+    purchase_token: str = Field(min_length=10, max_length=4096)
+
+
+class GooglePlayRtdnMessage(BaseModel):
+    data: str = Field(min_length=1)
+    message_id: Optional[str] = Field(default=None, alias="messageId")
+
+
+class GooglePlayRtdnEnvelope(BaseModel):
+    message: GooglePlayRtdnMessage

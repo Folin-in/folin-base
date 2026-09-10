@@ -1,7 +1,7 @@
 """The upload -> report pipeline, as declared in prompts/analysis_pipeline.md.
 
 Stages, each a method, run in this order and every gate can stop the run:
-  decode -> profile context -> SCREEN (gate) -> EXTRACT -> AUDIT (gate) -> biomarkers ->
+  decode -> profile context -> SCREEN (gate) -> TRANSCRIBE -> EXTRACT -> AUDIT (gate) -> biomarkers ->
   sanity bounds -> (Pro) VERIFY -> assemble -> persist -> gamification delta.
 
 Raises AnalysisRejected for anything that is the user's file's fault (mapped to 422 by the
@@ -14,6 +14,7 @@ import re
 import os
 import tempfile
 import uuid
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from core import storage
 from agents import (DocumentRejected, ExtractorAgent, OutputAuditor, ScreenerAgent,
                     TranscriberAgent, VerifierAgent)
 from agents.base import BadModelReply, ModelUnavailable
+from agents.attachments import attachment_scope
 from agents.registry import get as get_spec
 from agents.tools import TOOLS
 from app.constants import ALLOWED_MIME
@@ -91,6 +93,11 @@ class _Run:
     biomarkers: list[Biomarker] = field(default_factory=list)
     analyze_trajectory: tuple[int | None, str | None] = (None, None)
     verify_trajectory_id: int | None = None
+    job_id: str | None = None
+    deadline_at: datetime | None = None
+    stage_seconds: dict[str, float] = field(default_factory=dict)
+    transcription_status: str = "unavailable"
+    verification_status: str = "not_requested"
 
 
 class AnalysisPipeline:
@@ -113,20 +120,27 @@ class AnalysisPipeline:
     # ------------------------------------------------------------------ public
 
     async def run(self, files: list[AnalyzeFileIn], user_id: str, user: dict,
-                  member_id: str | None) -> AnalysisResult:
-        r = _Run(user_id=user_id, user=user, files=files, member_id=member_id_of(member_id))
+                  member_id: str | None, *, job_id: str | None = None,
+                  deadline_at: datetime | None = None) -> AnalysisResult:
+        r = _Run(user_id=user_id, user=user, files=files, member_id=member_id_of(member_id),
+                 job_id=job_id, deadline_at=deadline_at)
         try:
-            self._decode(r)
-            await self._context(r)
-            self._materialise(r)
-            await self._screen(r)
-            await self._transcribe(r)
-            await self._extract(r)
-            self._audit(r)
-            self._biomarkers(r)
-            await self._verify(r)
-            report = self._assemble(r)
-            return await self._persist(r, report)
+            with attachment_scope():
+                self._decode(r)
+                await self._context(r)
+                self._materialise(r)
+                for name, stage in (("screen", self._screen), ("transcribe", self._transcribe),
+                                    ("analyze", self._extract)):
+                    started = time.monotonic()
+                    await stage(r)
+                    r.stage_seconds[name] = round(time.monotonic() - started, 3)
+                self._audit(r)
+                self._biomarkers(r)
+                started = time.monotonic()
+                await self._verify(r)
+                r.stage_seconds["verify"] = round(time.monotonic() - started, 3)
+                report = self._assemble(r)
+                return await self._persist(r, report)
         finally:
             for p in r.tmp_paths:
                 if os.path.exists(p):
@@ -181,8 +195,12 @@ class AnalysisPipeline:
         except Exception as e:
             logger.warning("transcriber failed (continuing without it): %s", e)
             return
-        rows = parsed.get("results") if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+            logger.warning("transcriber returned no usable result list")
+            return
+        rows = parsed["results"]
         r.transcript = [x for x in (rows or []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
+        r.transcription_status = "completed" if r.transcript else "empty"
         r.lab_notes = [str(n).strip() for n in (parsed.get("notes") or []) if str(n).strip()][:LAB_NOTES_MAX]
         logger.info("transcribed %d result rows, %d lab notes", len(r.transcript), len(r.lab_notes))
 
@@ -291,12 +309,18 @@ class AnalysisPipeline:
         plan = (r.user.get("preferences") or {}).get("plan") or Plan.FREE
         if plan != Plan.PRO or not r.biomarkers:
             return
+        r.verification_status = "unavailable"
         try:
             mismatches, meta = await self.verifier.run(r.attachments, [b.model_dump() for b in r.biomarkers],
                                                        user_id=r.user_id)
         except Exception as e:
             logger.warning("verifier failed (skipping): %s", e)
+            for b in r.biomarkers:
+                b.needs_verification = True
+                b.verification_note = ("Automatic cross-check did not complete. Please compare this value with the original document. "
+                                       + (b.verification_note or "")).strip()[:VERIFY_NOTE_MAX]
             return
+        r.verification_status = "completed"
         if meta:
             r.verify_trajectory_id = meta.trajectory_id
         by_name = {str(m.get("name", "")).strip().lower(): m for m in mismatches}
@@ -309,10 +333,14 @@ class AnalysisPipeline:
                                        + (f" (Document shows: {expected})" if expected else ""))[:VERIFY_NOTE_MAX]
 
     def _assemble(self, r: _Run) -> Report:
-        return build_report(parsed=r.parsed, report_type=r.report_type, biomarkers=r.biomarkers, files=r.files,
+        report = build_report(parsed=r.parsed, report_type=r.report_type, biomarkers=r.biomarkers, files=r.files,
                             lab_notes=r.lab_notes,
                             raws=r.raws, user_id=r.user_id, member_id=r.member_id, display=r.display_name,
                             names_match=self._names_match)
+        if r.report_type == ReportType.LAB and r.transcription_status != "completed":
+            # This is our warning, not a note printed by the laboratory.
+            report.overall_assessment = (report.overall_assessment + "\n\nAutomatic row-by-row transcription did not complete. Compare with the original report for missing results.").strip()
+        return report
 
     async def _persist(self, r: _Run, report: Report) -> AnalysisResult:
         stored = []
@@ -326,28 +354,48 @@ class AnalysisPipeline:
         profile_before = compute_profile(r.existing, events=events)
 
         d = report.model_dump(exclude={"id"})
-        cols = list(d.keys())
-        new_id = await db.fetchval(
-            f"insert into reports ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))}) returning id",
-            *d.values())
-        report.id = str(new_id)
-
         traj_id, model = r.analyze_trajectory
-        if traj_id:
-            await db.execute("update reports set analysis_meta = $1 where id = $2::uuid",
-                             {"model": model, "trajectory_id": traj_id}, report.id)
-            await db.execute("update ai_trajectories set report_id = $1 where id = $2", report.id, traj_id)
-        if r.verify_trajectory_id:
-            await db.execute("update ai_trajectories set report_id = $1 where id = $2",
-                             report.id, r.verify_trajectory_id)
-        cache.invalidate_reports(r.user_id)
-
+        d["analysis_meta"] = {"model": model, "trajectory_id": traj_id,
+                              "stage_seconds": r.stage_seconds,
+                              "transcription_status": r.transcription_status,
+                              "verification_status": r.verification_status}
+        cols = list(d.keys())
         profile_after = compute_profile(r.existing + [report.model_dump()], events=events)
         before_ids = {b["id"] for b in profile_before["badges"] if b["unlocked"]}
+        xp_earned = profile_after["xp"] - profile_before["xp"]
+        new_badges = [b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids]
+        # Save the report and its terminal job state together. Expiry and completion
+        # lock the same job, so a timed-out upload cannot later publish a report.
+        async with db.transaction() as conn:
+            if r.job_id:
+                state = await conn.fetchval(
+                    "select status from analyze_jobs where job_id = $1 and user_id = $2 for update",
+                    r.job_id, r.user_id)
+                if state != "processing" or not r.deadline_at or datetime.now(timezone.utc) >= r.deadline_at:
+                    raise TimeoutError
+            new_id = await conn.fetchval(
+                f"insert into reports ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))}) returning id",
+                *d.values())
+            report.id = str(new_id)
+            if traj_id:
+                await conn.execute("update ai_trajectories set report_id = $1 where id = $2", report.id, traj_id)
+            if r.verify_trajectory_id:
+                await conn.execute("update ai_trajectories set report_id = $1 where id = $2",
+                                   report.id, r.verify_trajectory_id)
+            if r.job_id:
+                completed = await conn.fetchval(
+                    """update analyze_jobs set status = 'success', completed_at = $1, report_id = $2,
+                       xp_earned = $3, new_badges = $4, error = null, request_payload = null
+                       where job_id = $5 and status = 'processing' and clock_timestamp() < $6
+                       returning job_id""",
+                    datetime.now(timezone.utc).isoformat(), report.id, xp_earned, new_badges,
+                    r.job_id, r.deadline_at)
+                if not completed:
+                    raise TimeoutError
+        cache.invalidate_reports(r.user_id)
         return AnalysisResult(
             report_id=report.id, report=report.model_dump(),
-            xp_earned=profile_after["xp"] - profile_before["xp"],
-            new_badges=[b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids],
+            xp_earned=xp_earned, new_badges=new_badges,
             profile=profile_after)
 
     # ------------------------------------------------------------------ helpers

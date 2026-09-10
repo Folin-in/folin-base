@@ -3,7 +3,7 @@
 import json
 
 from agents._agent import Agent
-from agents.base import CallMeta
+from agents.base import BadModelReply, CallMeta
 
 _TASK = "Verify this extraction against the attached document:\n"
 _FIELDS = ("name", "value", "unit", "ref_range", "status")
@@ -21,4 +21,8 @@ class VerifierAgent(Agent):
         parsed = await self._client.call(system_prompt=self.spec.prompt,
                                          user_text=_TASK + json.dumps(compact, ensure_ascii=False),
                                          files=files, meta=meta)
-        return [m for m in (parsed.get("mismatches") or []) if isinstance(m, dict) and m.get("name")], meta
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("mismatches"), list):
+            raise BadModelReply("Verifier response is missing its mismatch list")
+        if any(not isinstance(m, dict) or not m.get("name") for m in parsed["mismatches"]):
+            raise BadModelReply("Verifier returned an invalid mismatch")
+        return parsed["mismatches"], meta
