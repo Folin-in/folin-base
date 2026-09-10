@@ -16,27 +16,14 @@ ALLOWED_MIME: dict[str, str] = {
 MAX_ANALYZE_FILES = 5
 MIN_FILE_BASE64_CHARS = 512               # smaller than this can never be a readable report
 MAX_UPLOAD_BASE64_BYTES = 14 * 1024 * 1024  # ~10 MB decoded; reject before decoding
-ANALYZE_JOB_TIMEOUT_SECS = 540
+ANALYZE_JOB_TIMEOUT_SECS = 200             # total budget from acceptance, including queueing/retries
 ANALYZE_JOB_GRACE_SECS = 30               # a 'processing' row older than timeout+grace is dead
 ANALYZE_WORKER_POLL_SECS = 2              # picks up jobs enqueued by another API worker
 PUSH_WORKER_POLL_SECS = 15 * 60           # notification scan / transient retry cadence
 PUSH_RECEIPT_DELAY_SECS = 15 * 60         # Expo recommends checking receipts after 15m
 PUSH_SEND_LOCAL_HOUR = 9                  # never send a reminder before 09:00 device-local
-# A healthy extractor call on a 14-page scan measures ~33s once thinking is bounded, so a
-# call still open at 120s is queued behind free-tier congestion, not working. Fail over
-# fast instead: the retry rounds below only help if each attempt is cheap.
-GEMINI_CALL_TIMEOUT_SECS = 120
-# Gemini 3 shares one 65k budget between thinking and answer tokens. Left unset, thinking on a
-# multi-page scan ran to 62k tokens (236s) and starved the answer, truncating the JSON mid-field.
-GEMINI_THINKING_LEVEL = "high"
-MODEL_COOLDOWN_SECS = 120                 # a failed model is skipped for this long
-# Gemini answers 503 "high demand" intermittently; one pass over the models gives up in ~14s
-# on a fault its own error text calls temporary. Re-sweep the models before failing the job.
-# Backoff is linear (round_no * backoff), so 4 rounds waits 0/20/40/60s = 2 min of patience
-# inside the job's own budget. A congestion spell outlasts seconds, and a job that fails in
-# 36s has spent none of the 540s it reserved.
-MODEL_RETRY_ROUNDS = 4
-MODEL_RETRY_BACKOFF_SECS = 20
+# Per-stage thinking, timeout and retry budgets live in agents/performance.py.
+MODEL_COOLDOWN_SECS = 120                 # recently failed models move to the back
 
 # --------------------------------------------------------------------- admin metrics
 # Windows the dashboard rolls up over. Timestamps are ISO-8601 UTC text, which sorts
@@ -135,8 +122,3 @@ TIPS_CACHE_TTL = 24 * 3600.0
 STORAGE_BUCKET = "reports"
 STORAGE_FILE_SIZE_LIMIT = 10 * 1024 * 1024
 SIGNED_URL_TTL_SECS = 3600
-
-# --------------------------------------------------------------------- payments
-RAZORPAY_API = "https://api.razorpay.com/v1"
-RAZORPAY_CURRENCY = "INR"
-RAZORPAY_TIMEOUT_SECS = 20

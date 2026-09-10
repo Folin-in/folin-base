@@ -24,7 +24,7 @@ from app.constants import (ALLOWED_MIME, ANALYZE_JOB_GRACE_SECS, ANALYZE_JOB_TIM
                            MIN_FILE_BASE64_CHARS)
 from app.enums import JobStatus, Plan
 from app.models import AnalyzeFileIn, AnalyzeRequest
-from core.rate_limit import check_and_increment_daily_quota, refund_daily_quota
+from core.rate_limit import refund_daily_quota
 from db import session as db
 from services.analysis import MSG_PROVIDER, pipeline
 from services.analysis_types import AnalysisRejected, InvalidUpload, UnsupportedDocument
@@ -45,16 +45,27 @@ MSG_TOO_LARGE = "Files too large (max 10 MB total). Try photos of the report ins
 MSG_INVALID = "Invalid file data."
 MSG_DUPLICATE = ("You already analyzed this exact document on {date}. "
                  "Open it from the Reports tab, or delete it first to re-analyze.")
-MSG_BUSY = ("“{filename}” is still being analyzed. It'll finish in under a minute - "
-            "your new report can go up right after.")
-MSG_FREE_EXHAUSTED = ("You've used your {n} free analyses. Upgrade to Pro for {daily} every day.")
-MSG_TIMEOUT = "Analysis timed out. Please try again with a clearer file."
+MSG_BUSY = ("“{filename}” is still being analyzed. "
+            "You can upload another report when it finishes.")
+MSG_FREE_EXHAUSTED = "You've used your {n} free analyses. Upgrade to Pro for unlimited analyses."
+MSG_TIMEOUT = "Analysis reached the 200-second limit and was stopped. Please try again."
 MSG_INTERRUPTED = "That analysis was interrupted. Please try uploading again."
 MSG_CRASHED = "Analysis crashed. Please try again. ({kind})"
 
 
 def _iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def deadline_for(created_at: str) -> datetime:
+    created = datetime.fromisoformat(created_at)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created + timedelta(seconds=ANALYZE_JOB_TIMEOUT_SECS)
+
+
+def remaining_seconds(created_at: str) -> float:
+    return max(0.0, (deadline_for(created_at) - datetime.now(timezone.utc)).total_seconds())
 
 
 def request_files(req: AnalyzeRequest) -> list[AnalyzeFileIn]:
@@ -71,6 +82,7 @@ def display_name(files: list[AnalyzeFileIn]) -> str:
 @dataclass(frozen=True)
 class Enqueued:
     job_id: str
+    created_at: str
     status: JobStatus = JobStatus.PENDING
 
 
@@ -78,6 +90,7 @@ class AnalyzeJobService:
     def __init__(self):
         self._worker_task: asyncio.Task | None = None
         self._wake: asyncio.Event | None = None
+        self._expiry_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- validation
 
@@ -122,41 +135,37 @@ class AnalyzeJobService:
             """select * from analyze_jobs where user_id = $1 and status = any($2::text[])
                order by created_at desc limit 5""",
             user_id, [str(s) for s in RUNNING])
-        cutoff = datetime.now(timezone.utc) - DEAD_AFTER
         for r in rows:
-            # A recoverable job remains active even after a process restart; the worker
-            # will reclaim it. Legacy jobs without a payload cannot be resumed.
-            if r.get("request_payload"):
-                return r
             try:
-                if datetime.fromisoformat(r["created_at"]) > cutoff:
+                if remaining_seconds(r["created_at"]) > 0:
                     return r
-            except ValueError:
-                continue
+            except (ValueError, TypeError):
+                pass
             await db.execute(
-                """update analyze_jobs set status = $1, completed_at = $2, error = $3
+                """update analyze_jobs set status = $1, completed_at = $2, error = $3,
+                   request_payload = null
                    where job_id = $4 and status = any($5::text[])""",
-                str(JobStatus.ERROR), _iso(), MSG_INTERRUPTED, r["job_id"], [str(s) for s in RUNNING])
+                str(JobStatus.ERROR), _iso(), MSG_TIMEOUT, r["job_id"], [str(s) for s in RUNNING])
         return None
 
     @staticmethod
     async def charge_quota(user: dict) -> None:
-        """Free = a lifetime trial allowance; Pro = a daily cap. Checked BEFORE the job is
+        """Free = a lifetime trial allowance; Pro = unlimited. Checked BEFORE the job is
         created so a refused upload never occupies the one-job slot."""
         plan = (user.get("preferences") or {}).get("plan") or Plan.FREE
         if plan == Plan.PRO:
-            await check_and_increment_daily_quota(user["user_id"], plan)
             return
         used = await db.fetchval(
             "select count(*) from analyze_jobs where user_id = $1 and status = $2",
             user["user_id"], str(JobStatus.SUCCESS))
         if used >= settings.free_total_analyses:
             raise HTTPException(status_code=403, detail=MSG_FREE_EXHAUSTED.format(
-                n=settings.free_total_analyses, daily=settings.pro_daily_analyses))
+                n=settings.free_total_analyses))
 
     # ---------------------------------------------------------------- lifecycle
 
     async def enqueue(self, req: AnalyzeRequest, user: dict) -> Enqueued:
+        created_at = _iso()
         files = request_files(req)
         self.validate(files)
         member_id = member_id_of(req.member_id)
@@ -172,10 +181,8 @@ class AnalyzeJobService:
                    (job_id, user_id, member_id, filename, mime_type, status, created_at, request_payload)
                    values ($1, $2, $3, $4, $5, $6, $7, $8)""",
                 job_id, user["user_id"], member_id, display_name(files), files[0].mime_type,
-                str(JobStatus.PENDING), _iso(), req.model_dump(mode="json"))
+                str(JobStatus.PENDING), created_at, req.model_dump(mode="json"))
         except asyncpg.UniqueViolationError:
-            if ((user.get("preferences") or {}).get("plan") or Plan.FREE) == Plan.PRO:
-                await refund_daily_quota(user["user_id"])
             running = await self.active_job(user["user_id"])
             raise HTTPException(status_code=409, detail=MSG_BUSY.format(
                 filename=(running or {}).get("filename") or "Your report"))
@@ -184,19 +191,24 @@ class AnalyzeJobService:
         else:
             # In-process ASGI tests intentionally do not run app lifespan. Production
             # always uses the durable worker started there.
-            asyncio.create_task(self._run(job_id, req, user["user_id"], dict(user)))
-        return Enqueued(job_id=job_id)
+            asyncio.create_task(self._run(job_id, req, user["user_id"], dict(user), created_at=created_at))
+        return Enqueued(job_id=job_id, created_at=created_at)
 
     async def status(self, job_id: str, user_id: str) -> dict:
         doc = await db.fetchrow("select * from analyze_jobs where job_id = $1 and user_id = $2", job_id, user_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Job not found")
-        if doc.get("status") in RUNNING and not doc.get("request_payload"):
+        if doc.get("status") in RUNNING:
             try:
-                if datetime.now(timezone.utc) - datetime.fromisoformat(doc["created_at"]) > DEAD_AFTER:
-                    doc = {**doc, "status": str(JobStatus.ERROR), "error": MSG_INTERRUPTED}
-            except ValueError:
-                pass
+                expired = remaining_seconds(doc["created_at"]) <= 0
+            except (ValueError, TypeError):
+                expired = True
+            if expired:
+                await self._fail(job_id, MSG_TIMEOUT)
+                # A simultaneous successful commit wins over expiry.
+                doc = await db.fetchrow("select * from analyze_jobs where job_id = $1 and user_id = $2", job_id, user_id)
+        doc["timeout_seconds"] = ANALYZE_JOB_TIMEOUT_SECS
+        doc["remaining_seconds"] = remaining_seconds(doc["created_at"]) if doc.get("status") in RUNNING else 0
         # Never return the base64 medical document to a polling client.
         doc.pop("request_payload", None)
         return doc
@@ -209,8 +221,14 @@ class AnalyzeJobService:
             return
         self._wake = asyncio.Event()
         self._worker_task = asyncio.create_task(self._worker(), name="folin-analyze-worker")
+        self._expiry_task = asyncio.create_task(self._expire_loop(), name="folin-analyze-expiry")
 
     async def stop(self) -> None:
+        if self._expiry_task:
+            self._expiry_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._expiry_task
+            self._expiry_task = None
         if not self._worker_task:
             return
         self._worker_task.cancel()
@@ -218,6 +236,19 @@ class AnalyzeJobService:
             await self._worker_task
         self._worker_task = None
         self._wake = None
+
+    async def _expire_loop(self) -> None:
+        """Expire queued/orphaned work even while the analysis worker is busy."""
+        while True:
+            try:
+                cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ANALYZE_JOB_TIMEOUT_SECS)).isoformat()
+                await db.execute(
+                    """update analyze_jobs set status = $1, completed_at = $2, error = $3,
+                       request_payload = null where status = any($4::text[]) and created_at <= $5""",
+                    str(JobStatus.ERROR), _iso(), MSG_TIMEOUT, [str(s) for s in RUNNING], cutoff)
+            except Exception:
+                logger.exception("analysis expiry sweep failed")
+            await asyncio.sleep(ANALYZE_WORKER_POLL_SECS)
 
     async def _claim(self, job_id: str | None = None) -> dict | None:
         """Atomically claim a pending job, or a processing job whose worker died.
@@ -269,8 +300,17 @@ class AnalyzeJobService:
                 await asyncio.sleep(ANALYZE_WORKER_POLL_SECS)
 
     async def _execute_claimed(self, job: dict) -> None:
+        if remaining_seconds(job["created_at"]) <= 0:
+            await self._fail(job["job_id"], MSG_TIMEOUT)
+            return
         payload = job.get("request_payload")
-        user = await db.fetchrow("select * from users where user_id = $1", job["user_id"])
+        try:
+            user = await asyncio.wait_for(
+                db.fetchrow("select * from users where user_id = $1", job["user_id"]),
+                timeout=remaining_seconds(job["created_at"]))
+        except TimeoutError:
+            await self._fail(job["job_id"], MSG_TIMEOUT)
+            return
         if not user or not payload:
             await self._fail(job["job_id"], MSG_INTERRUPTED)
             return
@@ -280,21 +320,22 @@ class AnalyzeJobService:
             await self._fail(job["job_id"], MSG_INTERRUPTED)
             await refund_daily_quota(job["user_id"])
             return
-        await self._run(job["job_id"], req, job["user_id"], user, mark_started=False)
+        await self._run(job["job_id"], req, job["user_id"], user,
+                        created_at=job["created_at"], mark_started=False)
 
     async def _run(self, job_id: str, req: AnalyzeRequest, user_id: str, user: dict,
-                   mark_started: bool = True) -> None:
+                   *, created_at: str, mark_started: bool = True) -> None:
         try:
-            if mark_started:
-                await self._mark(job_id, JobStatus.PROCESSING, started=True)
-            result = await asyncio.wait_for(
-                pipeline.run(request_files(req), user_id, user, req.member_id),
-                timeout=ANALYZE_JOB_TIMEOUT_SECS)
-            await db.execute(
-                """update analyze_jobs set status = $1, completed_at = $2, report_id = $3,
-                   xp_earned = $4, new_badges = $5, error = null, request_payload = null
-                   where job_id = $6""",
-                str(JobStatus.SUCCESS), _iso(), result.report_id, result.xp_earned, result.new_badges, job_id)
+            remaining = remaining_seconds(created_at)
+            if remaining <= 0:
+                raise TimeoutError
+            # One cancellation budget covers all AI requests, sleeps and storage work.
+            # Cancellation propagates through httpx and isn't swallowed by Exception handlers.
+            async with asyncio.timeout(remaining):
+                if mark_started:
+                    await self._mark(job_id, JobStatus.PROCESSING, started=True)
+                await pipeline.run(request_files(req), user_id, user, req.member_id,
+                                   job_id=job_id, deadline_at=deadline_for(created_at))
         except asyncio.TimeoutError:
             await self._fail(job_id, MSG_TIMEOUT); await refund_daily_quota(user_id)
         except InvalidUpload as e:
@@ -315,15 +356,15 @@ class AnalyzeJobService:
     @staticmethod
     async def _mark(job_id: str, status: JobStatus, started: bool = False) -> None:
         if started:
-            await db.execute("update analyze_jobs set status = $1, started_at = $2 where job_id = $3", str(status), _iso(), job_id)
+            await db.execute("update analyze_jobs set status = $1, started_at = $2 where job_id = $3 and status = 'pending'", str(status), _iso(), job_id)
         else:
             await db.execute("update analyze_jobs set status = $1, completed_at = $2 where job_id = $3", str(status), _iso(), job_id)
 
     @staticmethod
     async def _fail(job_id: str, message: str) -> None:
         await db.execute("""update analyze_jobs set status = $1, completed_at = $2, error = $3,
-                            request_payload = null where job_id = $4""",
-                         str(JobStatus.ERROR), _iso(), message, job_id)
+                            request_payload = null where job_id = $4 and status = any($5::text[])""",
+                         str(JobStatus.ERROR), _iso(), message, job_id, [str(s) for s in RUNNING])
 
 
 jobs = AnalyzeJobService()

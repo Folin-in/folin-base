@@ -1,0 +1,262 @@
+{
+  "created_at": "2026-09-10T06:35:00.335970+00:00",
+  "synthetic": true,
+  "scope": "One two-page fixture; AI stages only; no DB/storage. Both use shared connections and encoding cache. Exact-name matching may undercount aliases. Not clinical validation.",
+  "results": [
+    {
+      "configuration": "optimized",
+      "status": "success",
+      "extraction": {
+        "expected_rows": 12,
+        "returned_rows": 12,
+        "exact_field_matches": {
+          "name": 12,
+          "value": 12,
+          "unit": 12,
+          "ref_range": 12
+        },
+        "missing_exact_names": [],
+        "flagged_rows": []
+      },
+      "checks": {
+        "transcription": "completed",
+        "verification": "completed"
+      },
+      "seconds": 46.146,
+      "stages": [
+        {
+          "stage": "screen",
+          "model": "gemini-3-flash-preview",
+          "seconds": 3.644,
+          "status": "ok",
+          "thinking": "low",
+          "usage": {
+            "promptTokenCount": 3456,
+            "candidatesTokenCount": 36,
+            "totalTokenCount": 3492,
+            "promptTokensDetails": [
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              },
+              {
+                "modality": "TEXT",
+                "tokenCount": 1272
+              }
+            ],
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "transcribe",
+          "model": "gemini-3-flash-preview",
+          "seconds": 4.357,
+          "status": "ok",
+          "thinking": "low",
+          "usage": {
+            "promptTokenCount": 3158,
+            "candidatesTokenCount": 783,
+            "totalTokenCount": 3941,
+            "promptTokensDetails": [
+              {
+                "modality": "TEXT",
+                "tokenCount": 974
+              },
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              }
+            ],
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "analyze",
+          "model": "gemini-3-flash-preview",
+          "seconds": 19.985,
+          "status": "ok",
+          "thinking": "high",
+          "usage": {
+            "promptTokenCount": 5269,
+            "candidatesTokenCount": 2114,
+            "totalTokenCount": 10023,
+            "promptTokensDetails": [
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              },
+              {
+                "modality": "TEXT",
+                "tokenCount": 3085
+              }
+            ],
+            "thoughtsTokenCount": 2640,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "verify",
+          "model": "gemini-3-flash-preview",
+          "seconds": 18.154,
+          "status": "ok",
+          "thinking": "medium",
+          "usage": {
+            "promptTokenCount": 2889,
+            "candidatesTokenCount": 7,
+            "totalTokenCount": 6067,
+            "promptTokensDetails": [
+              {
+                "modality": "TEXT",
+                "tokenCount": 705
+              },
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              }
+            ],
+            "thoughtsTokenCount": 3171,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        }
+      ]
+    },
+    {
+      "configuration": "previous_high_effort",
+      "status": "success",
+      "extraction": {
+        "expected_rows": 12,
+        "returned_rows": 12,
+        "exact_field_matches": {
+          "name": 12,
+          "value": 12,
+          "unit": 12,
+          "ref_range": 12
+        },
+        "missing_exact_names": [],
+        "flagged_rows": []
+      },
+      "checks": {
+        "transcription": "completed",
+        "verification": "completed"
+      },
+      "seconds": 65.646,
+      "stages": [
+        {
+          "stage": "screen",
+          "model": "gemini-3-flash-preview",
+          "seconds": 4.736,
+          "status": "ok",
+          "thinking": "high",
+          "usage": {
+            "promptTokenCount": 3456,
+            "candidatesTokenCount": 36,
+            "totalTokenCount": 3945,
+            "promptTokensDetails": [
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              },
+              {
+                "modality": "TEXT",
+                "tokenCount": 1272
+              }
+            ],
+            "thoughtsTokenCount": 453,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "transcribe",
+          "model": "gemini-3-flash-preview",
+          "seconds": 16.261,
+          "status": "ok",
+          "thinking": "high",
+          "usage": {
+            "promptTokenCount": 3158,
+            "candidatesTokenCount": 783,
+            "totalTokenCount": 5957,
+            "promptTokensDetails": [
+              {
+                "modality": "TEXT",
+                "tokenCount": 974
+              },
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              }
+            ],
+            "thoughtsTokenCount": 2016,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "analyze",
+          "model": "gemini-3-flash-preview",
+          "seconds": 20.812,
+          "status": "ok",
+          "thinking": "high",
+          "usage": {
+            "promptTokenCount": 5269,
+            "candidatesTokenCount": 2114,
+            "totalTokenCount": 10023,
+            "cachedContentTokenCount": 2010,
+            "promptTokensDetails": [
+              {
+                "modality": "TEXT",
+                "tokenCount": 3085
+              },
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              }
+            ],
+            "cacheTokensDetails": [
+              {
+                "modality": "TEXT",
+                "tokenCount": 1177
+              },
+              {
+                "modality": "IMAGE",
+                "tokenCount": 833
+              }
+            ],
+            "thoughtsTokenCount": 2640,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        },
+        {
+          "stage": "verify",
+          "model": "gemini-3-flash-preview",
+          "seconds": 23.831,
+          "status": "ok",
+          "thinking": "high",
+          "usage": {
+            "promptTokenCount": 2889,
+            "candidatesTokenCount": 7,
+            "totalTokenCount": 5110,
+            "promptTokensDetails": [
+              {
+                "modality": "IMAGE",
+                "tokenCount": 2184
+              },
+              {
+                "modality": "TEXT",
+                "tokenCount": 705
+              }
+            ],
+            "thoughtsTokenCount": 2214,
+            "serviceTier": "standard"
+          },
+          "failed_attempts": []
+        }
+      ]
+    }
+  ]
+}

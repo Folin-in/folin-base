@@ -3,6 +3,7 @@ time from db/schema/*.sql in filename order - one file per table, 900_ for const
 each file idempotent, so a restart is always safe."""
 import json
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
@@ -80,3 +81,15 @@ async def fetchval(sql: str, *args):
 
 async def execute(sql: str, *args) -> str:
     return await _require_pool().execute(sql, *args)
+
+
+@asynccontextmanager
+async def transaction():
+    """Yield one asyncpg connection inside a transaction.
+
+    Services use this only when several database decisions must commit atomically.
+    Query values must still be passed as asyncpg parameters.
+    """
+    async with _require_pool().acquire() as conn:
+        async with conn.transaction():
+            yield conn

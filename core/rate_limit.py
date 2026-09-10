@@ -12,7 +12,6 @@ from fastapi import HTTPException, Request
 
 from app.config import settings
 from db import session as db
-from app.enums import Plan
 from app.constants import DAILY_QUOTA_FREE_GENERIC, DAILY_QUOTA_OVERRIDES
 
 
@@ -80,8 +79,8 @@ def check_ip_rate_limit(request: Request, bucket: str, max_hits: int, window_sec
 
 
 # ---------- Postgres-backed daily quota per user ----------
-# Analyze quota for FREE users is a lifetime total checked in reports.py, not here.
-DAILY_QUOTA_PRO = settings.pro_daily_analyses
+# Analysis entitlements are handled by the job service: Free has a lifetime trial
+# allowance and Pro is unlimited. This counter remains for named anti-abuse buckets.
 
 # Named per-bucket overrides. Buckets that don't appear here use the plan defaults above.
 
@@ -94,7 +93,7 @@ async def check_and_increment_daily_quota(user_id: str, plan: str, quota_bucket:
     """Atomically increment a per-user daily counter and reject if it exceeds the plan quota."""
     limit = DAILY_QUOTA_OVERRIDES.get(quota_bucket)
     if limit is None:
-        limit = DAILY_QUOTA_PRO if plan == Plan.PRO else DAILY_QUOTA_FREE_GENERIC
+        limit = DAILY_QUOTA_FREE_GENERIC
     day_key = _today_key()
     doc_id = f"{quota_bucket}:{user_id}:{day_key}"
 

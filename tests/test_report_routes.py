@@ -7,7 +7,8 @@ must still parse, authorise, call, and shape its response the same way.
 import asyncio
 import base64
 import uuid
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -146,7 +147,7 @@ def test_pending_job_can_be_claimed_and_recovered():
             """insert into analyze_jobs
                (job_id, user_id, member_id, filename, mime_type, status, created_at, request_payload)
                values ($1, $2, 'self', 'recover.png', 'image/png', 'pending', $3, $4)""",
-            job_id, uid, "2026-08-30T00:00:00+00:00", body)
+            job_id, uid, datetime.now(timezone.utc).isoformat(), body)
         fake.replies += [ACCEPT, lab()]
         claimed = await J.jobs._claim(job_id)
         assert claimed and claimed["job_id"] == job_id
@@ -155,6 +156,79 @@ def test_pending_job_can_be_claimed_and_recovered():
             "select status, report_id, request_payload from analyze_jobs where job_id = $1", job_id)
         assert row["status"] == "success" and row["report_id"] and row["request_payload"] is None
         await cleanup(email)
+    run(t)
+
+
+def test_expired_queued_job_is_terminal_and_does_not_use_free_trial():
+    async def t(c):
+        h, email = await user(c)
+        uid = await db.fetchval("select user_id from users where email = $1", email)
+        job_id = uuid.uuid4().hex[:16]
+        try:
+            await db.execute(
+                """insert into analyze_jobs (job_id, user_id, filename, status, created_at, request_payload)
+                   values ($1, $2, 'expired.png', 'pending', $3, $4)""",
+                job_id, uid, (datetime.now(timezone.utc) - timedelta(seconds=201)).isoformat(), {"files": []})
+            response = await c.get(f"/api/reports/analyze/status/{job_id}", headers=h)
+            assert response.status_code == 200
+            assert response.json()["status"] == "error"
+            assert response.json()["error"] == J.MSG_TIMEOUT
+            assert response.json()["remaining_seconds"] == 0
+            assert "request_payload" not in response.json()
+            assert await db.fetchval("select request_payload from analyze_jobs where job_id = $1", job_id) is None
+            assert await J.jobs.active_job(uid) is None
+            await J.jobs.charge_quota({"user_id": uid, "preferences": {"plan": "free"}})
+        finally:
+            await cleanup(email)
+    run(t)
+
+
+def test_deadline_during_save_rolls_back_report_and_success(monkeypatch):
+    async def t(c):
+        from app.models import Report
+        h, email = await user(c)
+        uid = await db.fetchval("select user_id from users where email = $1", email)
+        job_id = uuid.uuid4().hex[:16]
+        now = datetime.now(timezone.utc)
+        state = A._Run(user_id=uid, user={}, files=[], member_id="self", job_id=job_id,
+                       deadline_at=now + timedelta(seconds=30))
+        original_transaction = db.transaction
+        inserted = []
+
+        class DeadlineDuringInsert:
+            def __init__(self, conn):
+                self.conn = conn
+
+            async def fetchval(self, query, *args):
+                value = await self.conn.fetchval(query, *args)
+                if query.startswith("insert into reports"):
+                    inserted.append(value)
+                    state.deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                return value
+
+            async def execute(self, query, *args):
+                return await self.conn.execute(query, *args)
+
+        @asynccontextmanager
+        async def transaction_with_expiry():
+            async with original_transaction() as conn:
+                yield DeadlineDuringInsert(conn)
+
+        try:
+            await db.execute(
+                """insert into analyze_jobs (job_id, user_id, status, created_at, started_at, request_payload)
+                   values ($1, $2, 'processing', $3, $3, $4)""", job_id, uid, now.isoformat(), {"files": []})
+            with monkeypatch.context() as patch:
+                patch.setattr(db, "transaction", transaction_with_expiry)
+                with pytest.raises(TimeoutError):
+                    await A.pipeline._persist(state, Report(user_id=uid, uploaded_at=now.isoformat()))
+            assert len(inserted) == 1, "expiry must happen after insertion to exercise rollback"
+            assert await db.fetchval("select count(*) from reports where user_id = $1", uid) == 0
+            assert await db.fetchval("select status from analyze_jobs where job_id = $1", job_id) == "processing"
+            await J.jobs._fail(job_id, J.MSG_TIMEOUT)
+            assert await db.fetchval("select status from analyze_jobs where job_id = $1", job_id) == "error"
+        finally:
+            await cleanup(email)
     run(t)
 
 

@@ -54,6 +54,8 @@ class PlanAction(StrEnum):
     UPGRADED = "upgraded"
     DOWNGRADED = "downgraded"
     EXPIRED = "expired"
+    RENEWED = "renewed"
+    REVOKED = "revoked"
 
 
 class ScreenVerdict(StrEnum):

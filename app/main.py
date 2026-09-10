@@ -6,8 +6,9 @@ from fastapi import APIRouter, FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from agents.base import client as model_client
 from db import session as database
-from routers import admin, auth, family, members, payments, reports, users
+from routers import admin, auth, early_access, family, members, payments, reports, users
 from services.jobs import jobs
 from services.push_notifications import push_notifications
 
@@ -29,6 +30,7 @@ async def lifespan(_: FastAPI):
     finally:
         await push_notifications.stop()
         await jobs.stop()
+        await model_client.close()
         await database.close()
 
 
@@ -43,7 +45,7 @@ async def root():
 
 
 for r in (auth.router, reports.router, users.router, family.router, members.router,
-          payments.router, admin.router):
+          payments.router, early_access.router, admin.router):
     api_router.include_router(r)
 
 app.include_router(api_router)

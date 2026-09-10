@@ -1,30 +1,24 @@
-"""Razorpay verification: signature, amount authority, replay protection.
+"""Google Play subscription ownership and entitlement tests."""
 
-Order creation calls Razorpay's live test API; verification is pure local crypto, so the
-security-critical half runs offline. In-process against the real DB.
-
-    ./venv/bin/python -m pytest tests/test_payments.py -v
-"""
 import asyncio
 import hashlib
-import hmac
 import uuid
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
-import httpx  # noqa: E402
-
-from app.config import settings  # noqa: E402
+from app.config import settings as app_settings  # noqa: E402
+from app.main import app  # noqa: E402
 from core import rate_limit  # noqa: E402
 from db import session as db  # noqa: E402
-from services.payments import expected_signature  # noqa: E402
-from app.main import app  # noqa: E402
+from services import payments as payment_module  # noqa: E402
 
-# One loop for the whole run, owned by conftest - see its docstring.
 _LOOP = asyncio.get_event_loop()
 _ready = False
 
@@ -35,234 +29,250 @@ def run(coro):
         if not _ready:
             await db.connect()
             _ready = True
-        # Each test starts on a fresh throttle window: register is capped at 10 per 10
-        # minutes per IP, which a combined run blows through and then fails in a way that
-        # looks like a payments bug.
         rate_limit._WINDOWS.clear()
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            return await coro(c)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://t"
+        ) as client:
+            return await coro(client)
 
     return _LOOP.run_until_complete(_wrapped())
 
 
-def uniq(p="pay"):
-    return f"{p}_{uuid.uuid4().hex[:10]}"
+def uniq(prefix="play"):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-async def make_user(c):
-    """Register a throwaway user and return (user_id, auth headers)."""
+async def make_user(client):
     email = f"{uniq()}@example.com"
-    r = await c.post("/api/auth/register", json={
-        "email": email, "username": uniq("u"), "password": "Str0ng!Passw0rd",
-        "name": "Payer", "consent": True,
-    })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    return body["user"]["user_id"], email, {"Authorization": f"Bearer {body['access_token']}"}
-
-
-async def seed_order(user_id, order_id, amount=None, status="created"):
-    await db.execute(
-        """insert into payments (order_id, user_id, amount_inr, currency, status, created_at)
-           values ($1, $2, $3, 'INR', $4, '2026-08-08T00:00:00+00:00')""",
-        order_id, user_id, amount if amount is not None else settings.pro_price_inr, status,
+    response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": email,
+            "username": uniq("u"),
+            "password": "Str0ng!Passw0rd",
+            "name": "Subscriber",
+            "consent": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    return (
+        body["user"]["user_id"],
+        email,
+        {"Authorization": f"Bearer {body['access_token']}"},
     )
 
 
-def sign(order_id, payment_id, secret=None):
-    secret = secret or settings.razorpay_key_secret
-    return hmac.new(secret.encode(), f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
+def play_payload(
+    user_id: str, *, state="SUBSCRIPTION_STATE_ACTIVE", auto_renew=True, days=30
+):
+    expiry = (
+        (datetime.now(timezone.utc) + timedelta(days=days))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    return {
+        "subscriptionState": state,
+        "acknowledgementState": "ACKNOWLEDGEMENT_STATE_PENDING",
+        "latestOrderId": uniq("GPA"),
+        "externalAccountIdentifiers": {
+            "obfuscatedExternalAccountId": payment_module.account_hash(user_id),
+        },
+        "lineItems": [
+            {
+                "productId": "folin_pro",
+                "expiryTime": expiry,
+                "autoRenewingPlan": {"autoRenewEnabled": auto_renew},
+                "offerDetails": {"basePlanId": "monthly"},
+            }
+        ],
+    }
 
 
-# ------------------------------------------------------------------- signature
+@pytest.fixture(autouse=True)
+def configured_play(monkeypatch):
+    configured = replace(
+        app_settings,
+        google_play_package_name="com.folin.app",
+        google_play_pro_product_id="folin_pro",
+        google_play_pro_base_plan_id="monthly",
+        google_play_service_account_json='{"configured":"for mocked tests"}',
+    )
+    monkeypatch.setattr(payment_module, "settings", configured)
 
-def test_signature_matches_razorpay_scheme():
-    """Razorpay signs `order_id|payment_id` with the key secret, hex HMAC-SHA256."""
-    got = expected_signature("order_x", "pay_y", "secret_z")
-    want = hmac.new(b"secret_z", b"order_x|pay_y", hashlib.sha256).hexdigest()
-    assert got == want
+
+def test_account_hash_is_stable_non_pii_play_identifier():
+    user_id = "user-123"
+    got = payment_module.account_hash(user_id)
+    assert got == hashlib.sha256(b"folin:google-play:user-123").hexdigest()
+    assert len(got) == 64 and user_id not in got
 
 
-def test_forged_signature_rejected_and_plan_untouched():
-    async def t(c):
-        uid, email, h = await make_user(c)
-        oid = uniq("order")
-        await seed_order(uid, oid)
-        r = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": oid, "razorpay_payment_id": "pay_forged",
-            "razorpay_signature": "deadbeef" * 8,
-        })
-        assert r.status_code == 400
-        assert "not been charged" in r.json()["detail"]
-        row = await db.fetchrow("select status from payments where order_id = $1", oid)
-        assert row["status"] == "failed"
-        me = (await c.get("/api/auth/me", headers=h)).json()
-        assert (me.get("preferences") or {}).get("plan", "free") == "free", "forged signature bought Pro"
+def test_config_returns_product_and_account_binding(monkeypatch):
+    async def scenario(client):
+        uid, email, headers = await make_user(client)
+        response = await client.get("/api/payments/google-play/config", headers=headers)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["configured"] is True
+        assert body["product_id"] == "folin_pro"
+        assert body["base_plan_id"] == "monthly"
+        assert body["obfuscated_account_id"] == payment_module.account_hash(uid)
         await db.execute("delete from users where email = $1", email)
 
-    run(t)
+    run(scenario)
 
 
-def test_signature_from_wrong_secret_rejected():
-    """An attacker signing with a guessed/other secret must not pass."""
-    async def t(c):
-        uid, email, h = await make_user(c)
-        oid = uniq("order")
-        await seed_order(uid, oid)
-        r = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": oid, "razorpay_payment_id": "pay_1",
-            "razorpay_signature": sign(oid, "pay_1", secret="not-the-real-secret"),
-        })
-        assert r.status_code == 400
+def test_verified_active_purchase_grants_pro_and_acknowledges(monkeypatch):
+    async def scenario(client):
+        uid, email, headers = await make_user(client)
+        payload = play_payload(uid)
+        acknowledged = []
+
+        async def fake_get(_token):
+            return payload
+
+        async def fake_ack(token, product):
+            acknowledged.append((token, product))
+
+        monkeypatch.setattr(payment_module.payments, "_get_subscription", fake_get)
+        monkeypatch.setattr(payment_module.payments, "_acknowledge", fake_ack)
+        token = uniq("token")
+        response = await client.post(
+            "/api/payments/google-play/verify",
+            headers=headers,
+            json={"purchase_token": token},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["has_access"] is True
+        assert response.json()["preferences"]["plan"] == "pro"
+        assert acknowledged == [(token, "folin_pro")]
+        stored = await db.fetchrow(
+            "select * from google_play_subscriptions where purchase_token = $1", token
+        )
+        assert stored["user_id"] == uid and stored["acknowledged"] is True
         await db.execute("delete from users where email = $1", email)
 
-    run(t)
+    run(scenario)
 
 
-def test_valid_signature_activates_pro():
-    async def t(c):
-        uid, email, h = await make_user(c)
-        oid, pid = uniq("order"), uniq("pay")
-        await seed_order(uid, oid)
-        r = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": oid, "razorpay_payment_id": pid,
-            "razorpay_signature": sign(oid, pid),
-        })
-        assert r.status_code == 200, r.text
-        assert r.json()["preferences"]["plan"] == "pro"
+def test_cancelled_purchase_keeps_access_until_expiry(monkeypatch):
+    async def scenario(client):
+        uid, email, headers = await make_user(client)
+        payload = play_payload(
+            uid, state="SUBSCRIPTION_STATE_CANCELED", auto_renew=False
+        )
 
-        me = (await c.get("/api/auth/me", headers=h)).json()
-        assert me["preferences"]["plan"] == "pro"
-        assert me["preferences"]["plan_expires_at"]
+        async def fake_get(_token):
+            return payload
 
-        hist = (await c.get("/api/user/plan/history", headers=h)).json()
-        assert hist[0]["plan"] == "pro" and hist[0]["amount_inr"] == settings.pro_price_inr
+        async def fake_ack(_token, _product):
+            return None
+
+        monkeypatch.setattr(payment_module.payments, "_get_subscription", fake_get)
+        monkeypatch.setattr(payment_module.payments, "_acknowledge", fake_ack)
+        response = await client.post(
+            "/api/payments/google-play/verify",
+            headers=headers,
+            json={"purchase_token": uniq("token")},
+        )
+        body = response.json()
+        assert response.status_code == 200
+        assert body["has_access"] is True
+        assert body["auto_renewing"] is False
+        assert body["preferences"]["plan"] == "pro"
         await db.execute("delete from users where email = $1", email)
 
-    run(t)
+    run(scenario)
 
 
-# --------------------------------------------------------------------- replay
+def test_purchase_cannot_be_claimed_by_another_folin_account(monkeypatch):
+    async def scenario(client):
+        uid_a, email_a, headers_a = await make_user(client)
+        _, email_b, headers_b = await make_user(client)
+        payload = play_payload(uid_a)
 
-def test_replaying_same_payment_does_not_extend_term():
-    async def t(c):
-        uid, email, h = await make_user(c)
-        oid, pid = uniq("order"), uniq("pay")
-        await seed_order(uid, oid)
-        body = {"razorpay_order_id": oid, "razorpay_payment_id": pid, "razorpay_signature": sign(oid, pid)}
-        first = (await c.post("/api/payments/razorpay/verify", headers=h, json=body)).json()
-        second = (await c.post("/api/payments/razorpay/verify", headers=h, json=body)).json()
-        assert second["already_applied"] is True
-        assert first["preferences"]["plan_expires_at"] == second["preferences"]["plan_expires_at"], \
-            "replay extended the Pro term"
-        rows = await db.fetch("select count(*) as n from plan_history where user_id = $1", uid)
-        assert rows[0]["n"] == 1, "replay wrote a second plan_history row"
+        async def fake_get(_token):
+            return payload
+
+        async def fake_ack(_token, _product):
+            return None
+
+        monkeypatch.setattr(payment_module.payments, "_get_subscription", fake_get)
+        monkeypatch.setattr(payment_module.payments, "_acknowledge", fake_ack)
+        token = uniq("token")
+        assert (
+            await client.post(
+                "/api/payments/google-play/verify",
+                headers=headers_a,
+                json={"purchase_token": token},
+            )
+        ).status_code == 200
+        denied = await client.post(
+            "/api/payments/google-play/verify",
+            headers=headers_b,
+            json={"purchase_token": token},
+        )
+        assert denied.status_code == 409
+        for email in (email_a, email_b):
+            await db.execute("delete from users where email = $1", email)
+
+    run(scenario)
+
+
+def test_expired_purchase_removes_pro(monkeypatch):
+    async def scenario(client):
+        uid, email, headers = await make_user(client)
+        active = play_payload(uid)
+        expired = play_payload(
+            uid, state="SUBSCRIPTION_STATE_EXPIRED", auto_renew=False, days=-1
+        )
+
+        async def fake_ack(_token, _product):
+            return None
+
+        monkeypatch.setattr(payment_module.payments, "_acknowledge", fake_ack)
+        token = uniq("token")
+
+        async def active_get(_token):
+            return active
+
+        monkeypatch.setattr(payment_module.payments, "_get_subscription", active_get)
+        first = await client.post(
+            "/api/payments/google-play/verify",
+            headers=headers,
+            json={"purchase_token": token},
+        )
+        assert first.json()["preferences"]["plan"] == "pro"
+
+        async def expired_get(_token):
+            return expired
+
+        monkeypatch.setattr(payment_module.payments, "_get_subscription", expired_get)
+        second = await client.post(
+            "/api/payments/google-play/verify",
+            headers=headers,
+            json={"purchase_token": token},
+        )
+        assert second.json()["has_access"] is False
+        assert second.json()["preferences"]["plan"] == "free"
         await db.execute("delete from users where email = $1", email)
 
-    run(t)
-
-
-def test_same_payment_id_cannot_pay_a_second_order():
-    """One captured payment must not activate Pro on another order."""
-    async def t(c):
-        uid, email, h = await make_user(c)
-        o1, o2, pid = uniq("order"), uniq("order"), uniq("pay")
-        await seed_order(uid, o1)
-        await seed_order(uid, o2)
-        ok = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": o1, "razorpay_payment_id": pid, "razorpay_signature": sign(o1, pid)})
-        assert ok.status_code == 200
-        again = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": o2, "razorpay_payment_id": pid, "razorpay_signature": sign(o2, pid)})
-        assert again.status_code == 409, "same payment id activated a second order"
-        # ...and it must be a clean refusal, not a leaked database error
-        assert "duplicate key" not in again.text.lower()
-        row2 = await db.fetchrow("select status from payments where order_id = $1", o2)
-        assert row2["status"] == "created"
-        await db.execute("delete from users where email = $1", email)
-
-    run(t)
-
-
-# ------------------------------------------------------------------ ownership
-
-def test_cannot_verify_someone_elses_order():
-    async def t(c):
-        uid_a, email_a, _ = await make_user(c)
-        _, email_b, hb = await make_user(c)
-        oid, pid = uniq("order"), uniq("pay")
-        await seed_order(uid_a, oid)  # belongs to A
-        r = await c.post("/api/payments/razorpay/verify", headers=hb, json={
-            "razorpay_order_id": oid, "razorpay_payment_id": pid, "razorpay_signature": sign(oid, pid),
-        })
-        assert r.status_code == 404, "B verified A's order"
-        row = await db.fetchrow("select status from payments where order_id = $1", oid)
-        assert row["status"] == "created"
-        for e in (email_a, email_b):
-            await db.execute("delete from users where email = $1", e)
-
-    run(t)
-
-
-def test_unknown_order_rejected():
-    async def t(c):
-        _, email, h = await make_user(c)
-        r = await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": "order_nope", "razorpay_payment_id": "p",
-            "razorpay_signature": sign("order_nope", "p"),
-        })
-        assert r.status_code == 404
-        await db.execute("delete from users where email = $1", email)
-
-    run(t)
+    run(scenario)
 
 
 def test_endpoints_require_auth():
-    async def t(c):
-        assert (await c.post("/api/payments/razorpay/order")).status_code in (401, 403)
-        assert (await c.post("/api/payments/razorpay/verify", json={
-            "razorpay_order_id": "o", "razorpay_payment_id": "p", "razorpay_signature": "s",
-        })).status_code in (401, 403)
+    async def scenario(client):
+        assert (await client.get("/api/payments/google-play/config")).status_code in (
+            401,
+            403,
+        )
+        assert (
+            await client.post(
+                "/api/payments/google-play/verify",
+                json={"purchase_token": "token_long_enough"},
+            )
+        ).status_code in (401, 403)
 
-    run(t)
-
-
-# ---------------------------------------------------------------------- order
-
-def test_order_uses_server_price_and_is_live():
-    """Hits Razorpay's test API: the order must come back with OUR price, in paise."""
-    async def t(c):
-        _, email, h = await make_user(c)
-        r = await c.post("/api/payments/razorpay/order", headers=h)
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["amount"] == settings.pro_price_inr * 100
-        assert body["currency"] == "INR"
-        assert body["key_id"] == settings.razorpay_key_id
-        assert body["key_id"].startswith("rzp_test_"), "not a test key"
-        assert "secret" not in str(body).lower()
-
-        row = await db.fetchrow("select * from payments where order_id = $1", body["order_id"])
-        assert row["amount_inr"] == settings.pro_price_inr and row["status"] == "created"
-        await db.execute("delete from users where email = $1", email)
-
-    run(t)
-
-
-def test_pro_user_cannot_order_again():
-    async def t(c):
-        uid, email, h = await make_user(c)
-        oid, pid = uniq("order"), uniq("pay")
-        await seed_order(uid, oid)
-        await c.post("/api/payments/razorpay/verify", headers=h, json={
-            "razorpay_order_id": oid, "razorpay_payment_id": pid, "razorpay_signature": sign(oid, pid)})
-        r = await c.post("/api/payments/razorpay/order", headers=h)
-        assert r.status_code == 400 and "already on Pro" in r.json()["detail"]
-        await db.execute("delete from users where email = $1", email)
-
-    run(t)
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    run(scenario)

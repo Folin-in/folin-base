@@ -146,16 +146,23 @@ def test_member_id_query_param_cannot_reach_another_users_member():
 
 # ------------------------------------------------------------ payments
 
-def test_cannot_verify_or_learn_about_another_users_order():
+def test_cannot_claim_another_users_google_play_purchase():
     async def t(c):
         ha, a_id, ea = await user(c, plan="free"); hb, b_id, eb = await user(c, plan="free")
-        oid = f"order_{uuid.uuid4().hex[:12]}"
-        await db.execute("insert into payments (order_id, user_id, amount_inr, currency, status, created_at) values ($1,$2,299,'INR','created','2026-01-01')", oid, a_id)
-        r = await c.post("/api/payments/razorpay/verify", headers=hb, json={"razorpay_order_id": oid, "razorpay_payment_id": "p", "razorpay_signature": "s"})
-        # must be indistinguishable from a non-existent order
-        r2 = await c.post("/api/payments/razorpay/verify", headers=hb, json={"razorpay_order_id": "order_doesnotexist", "razorpay_payment_id": "p", "razorpay_signature": "s"})
-        assert r.status_code == r2.status_code == 404 and r.json() == r2.json()
-        assert (await db.fetchval("select status from payments where order_id = $1", oid)) == "created"
+        token = f"token_{uuid.uuid4().hex}"
+        await db.execute(
+            """insert into google_play_subscriptions
+                 (purchase_token,user_id,product_id,status,created_at,updated_at)
+               values ($1,$2,'folin_pro','active','2026-01-01','2026-01-01')""",
+            token, a_id,
+        )
+        r = await c.post(
+            "/api/payments/google-play/verify", headers=hb, json={"purchase_token": token}
+        )
+        assert r.status_code == 409
+        assert await db.fetchval(
+            "select user_id from google_play_subscriptions where purchase_token = $1", token
+        ) == a_id
         await cleanup(ea, eb)
     run(t)
 
