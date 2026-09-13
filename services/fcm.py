@@ -38,7 +38,10 @@ class FCMClient:
                 path = settings.firebase_service_account_file
                 if not path:
                     raise RuntimeError("Firebase credentials are not configured")
-                info = json.loads(Path(path).read_text())
+                if path.strip().startswith("{"):
+                    info = json.loads(path)
+                else:
+                    info = json.loads(Path(path).read_text())
                 project = info.get("project_id", "")
                 if not re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", project):
                     raise ValueError("Invalid Firebase project ID")
