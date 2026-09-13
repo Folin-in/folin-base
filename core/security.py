@@ -157,6 +157,11 @@ async def _user_from_supabase(claims: dict) -> dict:
     return await db.fetchrow("select * from users where user_id = $1", user["user_id"])
 
 
+def _check_not_blocked(user: dict) -> None:
+    if user.get("is_blocked") or (user.get("preferences") or {}).get("is_blocked"):
+        raise HTTPException(status_code=403, detail="Account suspended. Please contact support.")
+
+
 async def get_current_user(request: Request) -> dict:
     auth = request.headers.get("Authorization") or ""
     if not auth.startswith("Bearer "):
@@ -179,13 +184,17 @@ async def get_current_user(request: Request) -> dict:
         token_tv = int(payload.get("tv") or 0)
         if token_tv < current_tv:
             raise HTTPException(status_code=401, detail="Token revoked. Please sign in again.")
-        return await _expire_pro_if_due(user)
+        user = await _expire_pro_if_due(user)
+        _check_not_blocked(user)
+        return user
 
     # Not one of ours - try Supabase Auth. Both are accepted during the migration so
     # existing sessions keep working while clients move over.
     claims = decode_supabase_token(token)
     if claims:
-        return await _expire_pro_if_due(await _user_from_supabase(claims))
+        user = await _expire_pro_if_due(await _user_from_supabase(claims))
+        _check_not_blocked(user)
+        return user
 
     raise HTTPException(status_code=401, detail="Invalid or expired token")
 

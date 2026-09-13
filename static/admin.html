@@ -366,15 +366,32 @@ function render(d){
       <td class="sub">${esc(r.error || "—")}</td>`)}
   </section>`;
 
-  const grantPro = `<section><h2>Grant Pro Plan</h2>
-    <div class="card" style="max-width:580px">
-      <p class="sub" style="margin-top:0">Grant Pro access directly to any account (email, username, or user_id). Restricted to authorized admin IP.</p>
-      <div style="display:flex;gap:var(--s8);flex-wrap:wrap">
-        <input id="proIdentifier" type="text" placeholder="Email, username, or user_id" style="flex:2;min-width:200px">
-        <input id="proDays" type="number" value="365" min="1" max="3650" style="width:90px" title="Duration in days">
-        <button class="primary" id="btnGrantPro" onclick="doGrantPro()">Grant Pro</button>
+  const adminControls = `<section><h2>Admin Controls</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:var(--s13)">
+      <div class="card">
+        <div class="label" style="margin-bottom:var(--s8)">Grant Pro Plan</div>
+        <p class="sub" style="margin-top:0">Grant Pro access directly to any account (email, username, or user_id).</p>
+        <div style="display:flex;gap:var(--s8);flex-wrap:wrap">
+          <input id="proIdentifier" type="text" placeholder="Email, username, or user_id" style="flex:2;min-width:160px">
+          <input id="proDays" type="number" value="365" min="1" max="3650" style="width:80px" title="Duration in days">
+          <button class="primary" id="btnGrantPro" onclick="doGrantPro()">Grant Pro</button>
+        </div>
+        <div id="proMsg" style="margin-top:var(--s8);font-size:13px;display:none"></div>
       </div>
-      <div id="proMsg" style="margin-top:var(--s8);font-size:13px;display:none"></div>
+
+      <div class="card">
+        <div class="label" style="margin-bottom:var(--s8)">Block / Unblock User</div>
+        <p class="sub" style="margin-top:0">Suspend a user from accessing the API and signing in, or restore access.</p>
+        <div style="display:flex;gap:var(--s8);flex-wrap:wrap">
+          <input id="blockIdentifier" type="text" placeholder="Email, username, or user_id" style="flex:2;min-width:160px">
+          <input id="blockReason" type="text" placeholder="Reason (optional)" style="flex:1;min-width:120px">
+        </div>
+        <div style="display:flex;gap:var(--s8);margin-top:var(--s8)">
+          <button id="btnBlockUser" onclick="doBlockOrUnblock('block')" style="background:transparent;border:1px solid var(--bad);color:var(--bad);padding:6px 14px;border-radius:4px;cursor:pointer">Block User</button>
+          <button id="btnUnblockUser" onclick="doBlockOrUnblock('unblock')" style="background:#059669;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer">Unblock User</button>
+        </div>
+        <div id="blockMsg" style="margin-top:var(--s8);font-size:13px;display:none"></div>
+      </div>
     </div>
   </section>`;
 
@@ -422,7 +439,7 @@ function render(d){
     </div>
   </section>`;
 
-  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent + usersSection + grantPro;
+  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent + usersSection + adminControls;
   $("stamp").textContent = "updated " + new Date(d.generated_at).toLocaleTimeString();
   drawChart(d.timeseries);
   lastSeries = d.timeseries;
@@ -486,19 +503,26 @@ async function loadUsers(page = 1, silent = false){
 
     tbody.innerHTML = data.users.map(u => {
       const isPro = u.plan === "pro";
+      const isBlocked = !!u.is_blocked;
       const planPill = isPro
         ? `<span class="pill p-ok">PRO</span>${u.plan_expires_at ? ` <span class="sub">${esc(u.plan_expires_at.slice(0, 10))}</span>` : ""}`
         : `<span class="pill p-flat">FREE</span>`;
+      const blockedPill = isBlocked ? `<span class="pill p-bad" title="${esc(u.blocked_reason || 'Blocked')}">BLOCKED</span>` : "";
       const providerPill = `<span class="pill ${u.auth_provider === 'google' ? 'p-ok' : u.auth_provider === 'apple' ? 'p-warn' : 'p-flat'}">${esc(u.auth_provider)}</span>`;
       const lastActive = u.last_seen ? esc(u.last_seen.slice(0, 16).replace("T", " ")) : (u.created_at ? esc(u.created_at.slice(0, 10)) : "—");
       const regDate = u.created_at ? esc(u.created_at.slice(0, 10)) : "—";
-      const action = isPro
+      const proAction = isPro
         ? `<span class="sub" style="color:var(--good);font-weight:600">✓ Active</span>`
         : `<button onclick="quickGrantPro('${esc(u.email || u.username || u.user_id)}')" style="padding:3px 8px;font-size:11px">Grant Pro</button>`;
+      const blockAction = isBlocked
+        ? `<button onclick="toggleBlockUser('${esc(u.email || u.username || u.user_id)}', false)" style="padding:3px 8px;font-size:11px;background:#059669;color:#fff;border:none;border-radius:4px;cursor:pointer">Unblock</button>`
+        : `<button onclick="toggleBlockUser('${esc(u.email || u.username || u.user_id)}', true)" style="padding:3px 8px;font-size:11px;background:transparent;border:1px solid var(--bad);color:var(--bad);border-radius:4px;cursor:pointer">Block</button>`;
 
       return `<tr>
         <td>
-          <div style="font-weight:600">${esc(u.email)}</div>
+          <div style="font-weight:600;display:flex;align-items:center;gap:6px">
+            ${esc(u.email)} ${blockedPill}
+          </div>
           <div class="sub mono">${esc(u.username ? '@' + u.username : u.user_id)}${u.name ? ' · ' + esc(u.name) : ''}</div>
         </td>
         <td>${providerPill}</td>
@@ -508,7 +532,7 @@ async function loadUsers(page = 1, silent = false){
         <td class="num">${num(u.reports_count)}</td>
         <td class="num" style="font-weight:600">${num(u.api_calls_count)}</td>
         <td class="num">${num(u.ai_model_calls)}</td>
-        <td>${action}</td>
+        <td><div style="display:flex;gap:4px;align-items:center">${proAction} ${blockAction}</div></td>
       </tr>`;
     }).join("");
   } catch (e) {
@@ -601,6 +625,85 @@ async function doGrantPro(){
     msgEl.textContent = `❌ Network error: ${e.message}`;
   } finally {
     btn.disabled = false;
+  }
+}
+
+async function doBlockOrUnblock(action){
+  const idEl = $("blockIdentifier"), reasonEl = $("blockReason"), msgEl = $("blockMsg");
+  const identifier = idEl.value.trim();
+  const reason = reasonEl ? reasonEl.value.trim() : "";
+  if (!identifier) { alert("Please enter an email, username, or user_id"); return; }
+
+  const isBlock = action === "block";
+  if (isBlock && !confirm(`Are you sure you want to block ${identifier}? This will revoke all sessions immediately.`)) return;
+
+  msgEl.style.display = "block";
+  msgEl.style.color = "var(--muted)";
+  msgEl.textContent = isBlock ? "Blocking user..." : "Unblocking user...";
+
+  try {
+    const ep = isBlock ? `${BASE}/admin/block-user` : `${BASE}/admin/unblock-user`;
+    const payload = isBlock ? { identifier, reason } : { identifier };
+    const res = await fetch(ep, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
+      body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    if (res.ok) {
+      msgEl.style.color = "var(--good)";
+      msgEl.textContent = `✅ ${d.message || "Operation successful"}`;
+      idEl.value = "";
+      if (reasonEl) reasonEl.value = "";
+      loadUsers(currentUserPage, true);
+    } else {
+      msgEl.style.color = "var(--bad)";
+      msgEl.textContent = `❌ ${d.detail || "Operation failed"}`;
+    }
+  } catch (e) {
+    msgEl.style.color = "var(--bad)";
+    msgEl.textContent = `❌ Network error: ${e.message}`;
+  }
+}
+
+async function toggleBlockUser(identifier, doBlock){
+  if (doBlock) {
+    const reason = prompt(`Enter reason for blocking ${identifier} (optional):`, "Suspended by admin");
+    if (reason === null) return;
+    try {
+      const res = await fetch(`${BASE}/admin/block-user`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
+        body: JSON.stringify({ identifier, reason })
+      });
+      const d = await res.json();
+      if (res.ok) {
+        alert(d.message || "User blocked successfully");
+        loadUsers(currentUserPage, true);
+      } else {
+        alert("Error: " + (d.detail || "Failed to block user"));
+      }
+    } catch (e) {
+      alert("Network error: " + e.message);
+    }
+  } else {
+    if (!confirm(`Are you sure you want to unblock ${identifier}?`)) return;
+    try {
+      const res = await fetch(`${BASE}/admin/unblock-user`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
+        body: JSON.stringify({ identifier })
+      });
+      const d = await res.json();
+      if (res.ok) {
+        alert(d.message || "User unblocked successfully");
+        loadUsers(currentUserPage, true);
+      } else {
+        alert("Error: " + (d.detail || "Failed to unblock user"));
+      }
+    } catch (e) {
+      alert("Network error: " + e.message);
+    }
   }
 }
 

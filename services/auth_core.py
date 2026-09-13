@@ -87,6 +87,8 @@ class AuthCore:
 
     @staticmethod
     async def session(user: dict, family_id: str | None = None) -> dict:
+        if user.get("is_blocked") or (user.get("preferences") or {}).get("is_blocked"):
+            raise HTTPException(status_code=403, detail="Account suspended. Please contact support.")
         access = create_access_token(user["user_id"], user.get("token_version", 0))
         refresh = await issue_refresh_token(user["user_id"], family_id=family_id)
         return {"access_token": access, "refresh_token": refresh, "token_type": "bearer", "user": public_user(user)}

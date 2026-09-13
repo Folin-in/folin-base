@@ -6,6 +6,7 @@ starts building `updates` from request data cannot turn into injection."""
 USERS_UPDATABLE = frozenset({
     "name", "username", "email", "picture", "health_profile", "preferences", "password_hash",
     "google_id", "apple_id", "supabase_uid", "consented_at", "consent_version",
+    "is_blocked", "blocked_at", "blocked_reason",
 })
 MEMBERS_UPDATABLE = frozenset({"name", "relation", "age", "gender", "allergies"})
 SOCIAL_ID_COLUMNS = frozenset({"google_id", "apple_id"})

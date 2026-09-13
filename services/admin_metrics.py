@@ -253,6 +253,9 @@ class AdminMetricsService:
                 u.username,
                 u.name,
                 u.auth_provider,
+                coalesce(u.is_blocked, false) as is_blocked,
+                u.blocked_at,
+                u.blocked_reason,
                 coalesce(u.preferences->>'plan', 'free') as plan,
                 u.preferences->>'plan_expires_at' as plan_expires_at,
                 u.created_at,
@@ -272,6 +275,8 @@ class AdminMetricsService:
             d = dict(r)
             if d.get("last_seen") and hasattr(d["last_seen"], "isoformat"):
                 d["last_seen"] = d["last_seen"].isoformat()
+            if d.get("blocked_at") and hasattr(d["blocked_at"], "isoformat"):
+                d["blocked_at"] = d["blocked_at"].isoformat()
             user_list.append(d)
 
         return {

@@ -307,6 +307,115 @@ class UserService:
             },
         }
 
+    async def block_user(self, identifier: str, reason: str = "") -> dict:
+        clean_id = (identifier or "").strip()
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="identifier is required (email, username, or user_id)")
+
+        user = await db.fetchrow(
+            """
+            select user_id, email, username, name, preferences, is_blocked
+            from users
+            where lower(email) = lower($1) or lower(username) = lower($1) or user_id = $1
+            """,
+            clean_id,
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User '{clean_id}' not found")
+
+        if (user.get("email") or "").lower() in settings.admin_emails:
+            raise HTTPException(status_code=400, detail="Cannot block an admin account")
+
+        now = _now()
+        now_iso = now.isoformat()
+        reason = (reason or "").strip()
+
+        prefs = dict(user.get("preferences") or {})
+        prefs["is_blocked"] = True
+        prefs["blocked_at"] = now_iso
+        prefs["blocked_reason"] = reason
+
+        await db.execute(
+            """
+            update users
+            set is_blocked = true,
+                blocked_at = $1,
+                blocked_reason = $2,
+                token_version = token_version + 1,
+                preferences = $3
+            where user_id = $4
+            """,
+            now_iso,
+            reason,
+            prefs,
+            user["user_id"],
+        )
+
+        cache.invalidate(user["user_id"])
+        await revoke_all_refresh_tokens(user["user_id"])
+
+        return {
+            "ok": True,
+            "message": f"User '{user.get('email') or user['user_id']}' has been blocked",
+            "user": {
+                "user_id": user["user_id"],
+                "email": user["email"],
+                "username": user.get("username"),
+                "name": user.get("name") or "",
+                "is_blocked": True,
+                "blocked_at": now_iso,
+                "blocked_reason": reason,
+            },
+        }
+
+    async def unblock_user(self, identifier: str) -> dict:
+        clean_id = (identifier or "").strip()
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="identifier is required (email, username, or user_id)")
+
+        user = await db.fetchrow(
+            """
+            select user_id, email, username, name, preferences, is_blocked
+            from users
+            where lower(email) = lower($1) or lower(username) = lower($1) or user_id = $1
+            """,
+            clean_id,
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User '{clean_id}' not found")
+
+        prefs = dict(user.get("preferences") or {})
+        prefs["is_blocked"] = False
+        prefs.pop("blocked_at", None)
+        prefs.pop("blocked_reason", None)
+
+        await db.execute(
+            """
+            update users
+            set is_blocked = false,
+                blocked_at = null,
+                blocked_reason = null,
+                preferences = $1
+            where user_id = $2
+            """,
+            prefs,
+            user["user_id"],
+        )
+
+        cache.invalidate(user["user_id"])
+
+        return {
+            "ok": True,
+            "message": f"User '{user.get('email') or user['user_id']}' has been unblocked",
+            "user": {
+                "user_id": user["user_id"],
+                "email": user["email"],
+                "username": user.get("username"),
+                "name": user.get("name") or "",
+                "is_blocked": False,
+            },
+        }
+
 
     # ------------------------------------------------------------ export / delete
 

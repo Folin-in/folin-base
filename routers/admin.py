@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from app.config import settings
 from app.constants import METRIC_WINDOWS
-from app.models import GrantProRequest
+from app.models import BlockUserRequest, GrantProRequest, UnblockUserRequest
 from core.security import get_admin_user, get_client_ip, is_ip_allowed, require_admin_ip
 from services.admin_metrics import admin_metrics
 from services.users import users
@@ -53,6 +53,22 @@ async def grant_pro(req: GrantProRequest,
                     _: str = Depends(require_admin_ip)):
     """Grant Pro access to a user. Strictly gated to authorized admin IPs."""
     return await users.grant_pro(req.identifier, req.days)
+
+
+@router.post("/block-user")
+@router.post("/block")
+async def block_user(req: BlockUserRequest,
+                     _: str = Depends(require_admin_ip)):
+    """Block/suspend a user account and immediately revoke all active sessions. Gated to authorized admin IPs."""
+    return await users.block_user(req.identifier, req.reason or "")
+
+
+@router.post("/unblock-user")
+@router.post("/unblock")
+async def unblock_user(req: UnblockUserRequest,
+                       _: str = Depends(require_admin_ip)):
+    """Unblock/restore a suspended user account. Gated to authorized admin IPs."""
+    return await users.unblock_user(req.identifier)
 
 
 @router.get("/users")
