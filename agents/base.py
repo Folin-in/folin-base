@@ -8,6 +8,7 @@
 - low-variance generation (temperature 0); provider output is not guaranteed deterministic.
 """
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ import httpx
 from agents.tools import TOOLS
 from agents.attachments import encode_attachment
 from agents.performance import DEFAULT_POLICY, POLICIES, CallPolicy, thinking_config
+from agents.provider_errors import provider_error_details
 from app.config import settings
 from app.constants import MODEL_COOLDOWN_SECS
 from app.enums import TrajectoryKind
@@ -49,10 +51,10 @@ class CallMeta:
 
 def model_order(models: list[str], failed_at: dict[str, float], now: float,
                 cooldown: float = MODEL_COOLDOWN_SECS) -> list[str]:
-    """Priority order with recently-failed models moved to the back - never dropped, so if
-    everything is cooling down we still try them all rather than fail instantly."""
+    """Skip cooling models while healthy alternatives exist. If all are cooling,
+    probe the least recently failed first, allowing recovery without a long sleep."""
     healthy = [m for m in models if now - failed_at.get(m, -cooldown) >= cooldown]
-    return healthy + [m for m in models if m not in healthy]
+    return healthy or sorted(models, key=lambda m: failed_at.get(m, -cooldown))
 
 
 class ModelClient:
@@ -96,25 +98,32 @@ class ModelClient:
                        "thinking_level": policy.thinking, "stage_budget_seconds": policy.total_seconds}
         started = time.monotonic()
         deadline = started + policy.total_seconds
-        last_err: Exception | None = None
+        last_reason = "Model request budget exhausted"
         permanent_failures: set[str] = set()
+        timed_out: set[str] = set()
 
         # A 503 "high demand" is transient by Google's own wording, so sweep the models
         # more than once before declaring the provider unavailable.
         for round_no in range(policy.retry_rounds):
-            if all(model in permanent_failures for model in self._models):
+            eligible = [model for model in self._models
+                        if model not in permanent_failures and model not in timed_out]
+            candidates = model_order(eligible, self._failed_at, time.monotonic())
+            if not candidates:
                 break
             if round_no:
                 delay = policy.backoff_seconds * round_no
                 if deadline - time.monotonic() <= delay:
                     break
                 await asyncio.sleep(delay)
-            for model in model_order(self._models, self._failed_at, time.monotonic()):
-                if model in permanent_failures:
-                    continue
+            for index, model in enumerate(candidates):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
+                # Reserve a fair share for every fallback still in this sweep.
+                # With three eligible models, interpretation starts at ~40s each
+                # rather than allowing the first two to exhaust the entire stage.
+                # Fast failures leave their unused time available to later models.
+                attempt_seconds = min(policy.attempt_seconds, remaining / (len(candidates) - index))
                 generation = dict(body["generationConfig"])
                 thinking = thinking_config(model, policy.thinking)
                 if thinking:
@@ -123,22 +132,42 @@ class ModelClient:
                 try:
                     # Wall-clock timeout also bounds streaming/trickling responses;
                     # httpx's read timeout alone only limits gaps between chunks.
-                    async with asyncio.timeout(min(policy.attempt_seconds, remaining)):
+                    async with asyncio.timeout(attempt_seconds):
                         resp = await self._connection().post(
                             GEMINI_ENDPOINT.format(model=model),
                             json={**body, "generationConfig": generation},
                             headers={"x-goog-api-key": self._api_key},
-                            timeout=httpx.Timeout(min(policy.attempt_seconds, remaining), connect=10, pool=5))
+                            timeout=httpx.Timeout(attempt_seconds,
+                                                  connect=min(10, attempt_seconds),
+                                                  pool=min(5, attempt_seconds)))
                     resp.raise_for_status()
                 except (httpx.HTTPError, TimeoutError) as e:
                     # Provider fault: cool this model down and try the next one.
                     self._failed_at[model] = time.monotonic()
-                    last_err = e
+                    # A timed-out attempt already used its wall-clock allowance.
+                    # Do not spend a second allowance on that model in this call.
+                    if isinstance(e, (TimeoutError, httpx.TimeoutException)):
+                        timed_out.add(model)
                     code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
-                    request_log["attempts"].append({"model": model, "error": type(e).__name__,
+                    attempt = {"model": model, "error": type(e).__name__,
                                                      "http_status": code,
-                                                     "latency_ms": int((time.monotonic() - attempt_started) * 1000)})
-                    logger.warning("model %s failed (%s: %s); trying next", model, type(e).__name__, e)
+                                                     "timeout_seconds": round(attempt_seconds, 3),
+                                                     "latency_ms": int((time.monotonic() - attempt_started) * 1000)}
+                    if isinstance(e, httpx.HTTPStatusError):
+                        sensitive = [self._api_key, system_prompt, user_text]
+                        sensitive.extend(path for path, _ in files)
+                        sensitive.extend(p["inline_data"]["data"] for p in parts if "inline_data" in p)
+                        details = provider_error_details(e.response, sensitive)
+                        attempt["provider_error"] = details
+                        last_reason = f"HTTP {code}: {json.dumps(details, ensure_ascii=True)}"
+                    else:
+                        # Exception text can include URLs, credentials or input. The
+                        # concrete class distinguishes local/transport timeouts safely.
+                        last_reason = type(e).__name__
+                    request_log["attempts"].append(attempt)
+                    logger.warning("model %s stage=%s failed: %s; attempt_timeout=%.3fs elapsed=%.3fs",
+                                   model, str(meta.kind) if meta else "unknown", last_reason,
+                                   attempt_seconds, attempt["latency_ms"] / 1000)
                     if code in (401, 403):
                         await self._log(meta, request_log, None, None, "error", "Provider authorization failed", started)
                         raise ModelUnavailable("Provider authorization failed") from e
@@ -165,7 +194,7 @@ class ModelClient:
                 await self._log(meta, request_log, model, text, "ok", None, started)
                 return parsed
 
-        reason = (str(last_err) or type(last_err).__name__) if last_err else "Model request budget exhausted"
+        reason = last_reason
         await self._log(meta, request_log, None, None, "error", reason[:500], started)
         raise ModelUnavailable(reason)
 

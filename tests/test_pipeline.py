@@ -69,7 +69,7 @@ def run(coro):
 
 
 def pipeline_with(*replies) -> A.AnalysisPipeline:
-    p = A.AnalysisPipeline()
+    p = A.AnalysisPipeline(defer_verification=False)
     fake = FakeClient(replies)
     for agent in (p.screener, p.extractor, p.verifier):
         agent._client = fake

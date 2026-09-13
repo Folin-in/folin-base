@@ -90,6 +90,10 @@ class MeasuredClient(ModelClient):
 
 
 class BenchmarkPipeline(AnalysisPipeline):
+    def __init__(self):
+        # Measure the full set of quality checks without enqueueing durable jobs.
+        super().__init__(defer_verification=False)
+
     async def _context(self, r):
         r.display_name = "Sample Person"
         r.profile_context = self.extractor.profile_context(r.display_name, {"age": 35, "sex": "male"})

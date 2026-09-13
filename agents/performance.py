@@ -1,4 +1,4 @@
-"""Latency budgets per task. All remain inside the upload's 200-second deadline."""
+"""Per-AI-call latency budgets. Uploads have no overall elapsed-time cutoff."""
 from dataclasses import dataclass
 
 
@@ -13,10 +13,12 @@ class CallPolicy:
 
 DEFAULT_POLICY = CallPolicy()
 POLICIES = {
-    "screen": CallPolicy("low", 25, 15),
-    "transcribe": CallPolicy("low", 45, 30),
-    "analyze": CallPolicy("high", 85, 60),
-    "verify": CallPolicy("medium", 30, 20),
+    "screen": CallPolicy("low", 25, 8, retry_rounds=1),
+    "transcribe": CallPolicy("low", 36, 12, retry_rounds=1),
+    # Interpretation retains a bounded request budget, but saving and queue time
+    # are not cancelled by an overall job timer. Verification runs after saving.
+    "analyze": CallPolicy("high", 120, 60),
+    "verify": CallPolicy("medium", 30, 10, retry_rounds=1),
 }
 
 

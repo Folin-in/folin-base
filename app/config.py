@@ -104,6 +104,7 @@ class Settings:
     smtp_pass: str
     smtp_from: str
     expo_access_token: str
+    firebase_service_account_file: str
     # --- network
     cors_allowed_origins: list[str]
     admin_emails: list[str]
@@ -195,6 +196,7 @@ def _load() -> Settings:
         smtp_pass=_req("SMTP_PASS") if smtp_host else "",
         smtp_from=_req("SMTP_FROM").strip() if smtp_host else "",
         expo_access_token=os.environ.get("EXPO_ACCESS_TOKEN", "").strip(),
+        firebase_service_account_file=os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", "").strip(),
         cors_allowed_origins=cors,
         trusted_proxy_ips=frozenset(_csv("TRUSTED_PROXY_IPS")),
     )

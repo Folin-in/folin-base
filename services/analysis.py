@@ -2,7 +2,7 @@
 
 Stages, each a method, run in this order and every gate can stop the run:
   decode -> profile context -> SCREEN (gate) -> TRANSCRIBE -> EXTRACT -> AUDIT (gate) -> biomarkers ->
-  sanity bounds -> (Pro) VERIFY -> assemble -> persist -> gamification delta.
+  sanity bounds -> assemble -> persist + enqueue Pro verification -> gamification delta.
 
 Raises AnalysisRejected for anything that is the user's file's fault (mapped to 422 by the
 router, quota refunded), UnsupportedDocument for a non-medical file (400, still counts),
@@ -33,6 +33,7 @@ from services.gamification import STATUS_WEIGHT, compute_profile, effective_date
 from app.models import AnalyzeFileIn, Biomarker, Report
 from services.analysis_types import AnalysisRejected, AnalysisResult, InvalidUpload, UnsupportedDocument
 from services.report_mapper import build_report, display_name
+from services.report_notes import NOTE_POLICY_VERSION, detail_sections, select_report_notes
 from services.engagement import fetch_events
 from services.members import member_id_of, resolve_member_profile
 from services.scoring import status_from_range
@@ -88,22 +89,25 @@ class _Run:
     parsed: dict = field(default_factory=dict)
     transcript: list[dict] = field(default_factory=list)
     lab_notes: list[str] = field(default_factory=list)
+    source_notes: list[str] = field(default_factory=list)
     recovered: int = 0
     report_type: ReportType = ReportType.OTHER
     biomarkers: list[Biomarker] = field(default_factory=list)
     analyze_trajectory: tuple[int | None, str | None] = (None, None)
     verify_trajectory_id: int | None = None
     job_id: str | None = None
-    deadline_at: datetime | None = None
+    claim_started_at: str | None = None
     stage_seconds: dict[str, float] = field(default_factory=dict)
     transcription_status: str = "unavailable"
     verification_status: str = "not_requested"
+    note_review: dict = field(default_factory=dict)
 
 
 class AnalysisPipeline:
     """Composes the agents. Instantiated once; safe to share - agents hold no per-run state."""
 
-    def __init__(self):
+    def __init__(self, *, defer_verification: bool = True):
+        self.defer_verification = defer_verification
         spec = get_spec("analysis_pipeline")
         for sub in ("screener", "transcriber", "extractor", "auditor", "verifier"):
             spec.assert_may_call(subagent=sub)
@@ -121,9 +125,9 @@ class AnalysisPipeline:
 
     async def run(self, files: list[AnalyzeFileIn], user_id: str, user: dict,
                   member_id: str | None, *, job_id: str | None = None,
-                  deadline_at: datetime | None = None) -> AnalysisResult:
+                  claim_started_at: str | None = None) -> AnalysisResult:
         r = _Run(user_id=user_id, user=user, files=files, member_id=member_id_of(member_id),
-                 job_id=job_id, deadline_at=deadline_at)
+                 job_id=job_id, claim_started_at=claim_started_at)
         try:
             with attachment_scope():
                 self._decode(r)
@@ -136,9 +140,14 @@ class AnalysisPipeline:
                     r.stage_seconds[name] = round(time.monotonic() - started, 3)
                 self._audit(r)
                 self._biomarkers(r)
-                started = time.monotonic()
-                await self._verify(r)
-                r.stage_seconds["verify"] = round(time.monotonic() - started, 3)
+                if self.defer_verification:
+                    if (r.user.get("preferences") or {}).get("plan") == Plan.PRO and r.biomarkers:
+                        r.verification_status = "pending"
+                else:
+                    # Explicit synchronous mode for offline evaluation, not uploads.
+                    started = time.monotonic()
+                    await self._verify(r)
+                    r.stage_seconds["verify"] = round(time.monotonic() - started, 3)
                 report = self._assemble(r)
                 return await self._persist(r, report)
         finally:
@@ -201,7 +210,8 @@ class AnalysisPipeline:
         rows = parsed["results"]
         r.transcript = [x for x in (rows or []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
         r.transcription_status = "completed" if r.transcript else "empty"
-        r.lab_notes = [str(n).strip() for n in (parsed.get("notes") or []) if str(n).strip()][:LAB_NOTES_MAX]
+        r.source_notes = select_report_notes(parsed.get("notes"), None).notes
+        r.lab_notes = r.source_notes[:LAB_NOTES_MAX]
         logger.info("transcribed %d result rows, %d lab notes", len(r.transcript), len(r.lab_notes))
 
     def _reconcile_transcript(self, r: _Run) -> None:
@@ -239,6 +249,7 @@ class AnalysisPipeline:
         try:
             r.parsed, meta = await self.extractor.run(r.attachments, r.profile_context,
                                                      language=r.language, transcript=r.transcript,
+                                                     source_notes=r.source_notes,
                                                      user_id=r.user_id)
         except BadModelReply:
             raise UnsupportedDocument(MSG_UNREADABLE)
@@ -258,6 +269,12 @@ class AnalysisPipeline:
         except ValueError:
             r.report_type = ReportType.LAB if r.parsed.get("biomarkers") else ReportType.OTHER
         self._reconcile_transcript(r)
+        review = select_report_notes(r.source_notes, r.parsed.get("note_decisions"), detail_sections(r.parsed))
+        r.lab_notes = review.notes[:LAB_NOTES_MAX]
+        r.note_review = {"policy": NOTE_POLICY_VERSION, "status": "completed" if review.reviewed else "unavailable",
+                         "decisions": review.decisions, "source_notes": r.source_notes}
+        if not review.reviewed:
+            logger.warning("note relevance review incomplete; preserving source notes")
 
     def _audit(self, r: _Run) -> None:
         try:
@@ -358,25 +375,34 @@ class AnalysisPipeline:
         d["analysis_meta"] = {"model": model, "trajectory_id": traj_id,
                               "stage_seconds": r.stage_seconds,
                               "transcription_status": r.transcription_status,
-                              "verification_status": r.verification_status}
+                              "verification_status": r.verification_status,
+                              "note_review": r.note_review}
         cols = list(d.keys())
         profile_after = compute_profile(r.existing + [report.model_dump()], events=events)
         before_ids = {b["id"] for b in profile_before["badges"] if b["unlocked"]}
         xp_earned = profile_after["xp"] - profile_before["xp"]
         new_badges = [b for b in profile_after["badges"] if b["unlocked"] and b["id"] not in before_ids]
-        # Save the report and its terminal job state together. Expiry and completion
-        # lock the same job, so a timed-out upload cannot later publish a report.
+        # Save the report and its terminal state together. Ownership fencing prevents
+        # a worker whose lease was reclaimed from publishing a duplicate report.
         async with db.transaction() as conn:
             if r.job_id:
                 state = await conn.fetchval(
-                    "select status from analyze_jobs where job_id = $1 and user_id = $2 for update",
-                    r.job_id, r.user_id)
-                if state != "processing" or not r.deadline_at or datetime.now(timezone.utc) >= r.deadline_at:
-                    raise TimeoutError
+                    """select status from analyze_jobs where job_id = $1 and user_id = $2
+                       and ($3::text is null or started_at = $3) for update""",
+                    r.job_id, r.user_id, r.claim_started_at)
+                if state != "processing":
+                    raise RuntimeError("Analysis job is no longer owned by this worker")
             new_id = await conn.fetchval(
                 f"insert into reports ({', '.join(cols)}) values ({', '.join(f'${i + 1}' for i in range(len(cols)))}) returning id",
                 *d.values())
             report.id = str(new_id)
+            if r.verification_status == "pending":
+                await conn.execute(
+                    """insert into verification_jobs (report_id, user_id, payload)
+                       values ($1::uuid, $2, $3)""",
+                    report.id, r.user_id,
+                    {"files": [f.model_dump(mode="json") for f in r.files],
+                     "biomarkers": [b.model_dump() for b in r.biomarkers]})
             if traj_id:
                 await conn.execute("update ai_trajectories set report_id = $1 where id = $2", report.id, traj_id)
             if r.verify_trajectory_id:
@@ -386,12 +412,16 @@ class AnalysisPipeline:
                 completed = await conn.fetchval(
                     """update analyze_jobs set status = 'success', completed_at = $1, report_id = $2,
                        xp_earned = $3, new_badges = $4, error = null, request_payload = null
-                       where job_id = $5 and status = 'processing' and clock_timestamp() < $6
+                       where job_id = $5 and status = 'processing'
+                         and ($6::text is null or started_at = $6)
                        returning job_id""",
                     datetime.now(timezone.utc).isoformat(), report.id, xp_earned, new_badges,
-                    r.job_id, r.deadline_at)
+                    r.job_id, r.claim_started_at)
                 if not completed:
-                    raise TimeoutError
+                    raise RuntimeError("Analysis job is no longer owned by this worker")
+                await conn.execute(
+                    "insert into analysis_notifications (report_id, user_id) values ($1::uuid, $2)",
+                    report.id, r.user_id)
         cache.invalidate_reports(r.user_id)
         return AnalysisResult(
             report_id=report.id, report=report.model_dump(),

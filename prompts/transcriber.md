@@ -66,13 +66,16 @@ Return JSON only, no markdown fences:
       "page": integer        // page number this row was read from
     }
   ],
-  "notes": [ string ],       // interpretive comments printed BY THE LAB, verbatim:
-                             // "Doctor's Note: ...", "Comment: ...", "Impression: ...",
-                             // "Advice: ...". Empty list if the document has none.
+  "notes": [ string ],       // source notes/comments copied verbatim, not result rows
   "not_a_lab_report": boolean  // true only if the document contains no results table at all
 }
 
 ## Before you answer
+
+Copy source notes verbatim, separating independently printed notes into separate
+entries. Another stage decides relevance and duplication against the finished
+report. Do not classify or paraphrase them here. Completeness of result rows
+remains your primary task. If there are no notes, return an empty notes array.
 
 Count the rows you transcribed and compare against what you saw on the pages. If a panel
 named on a heading has more members than you have listed, go back and read that panel again.

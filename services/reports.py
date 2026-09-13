@@ -89,6 +89,7 @@ class ReportService:
         for s in doc.get("suggestions", []) or []:
             s["category"] = normalize_category(s.get("category"))
         out = Report.from_row(doc).model_dump()
+        out["verification_status"] = (doc.get("analysis_meta") or {}).get("verification_status", "not_requested")
         paths = [p for p in (doc.get("storage_path") or "").split(",") if p]
         urls = [u for u in [await storage.signed_url(p) for p in paths] if u]
         out["file_url"] = urls[0] if urls else None
@@ -152,26 +153,42 @@ class ReportService:
         if changed:
             await self._refresh_advice(b, suggestions, doc, user, report_id)
 
-        biomarkers[req.index] = b
         is_lab = (doc.get("report_type") or ReportType.LAB) == ReportType.LAB
-        await db.execute(
-            """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
-               total_count = $4, health_score = $5, suggestions = $6 where id = $7::uuid""",
-            biomarkers,
-            sum(1 for x in biomarkers if x.get("status") == BiomarkerStatus.NORMAL),
-            sum(1 for x in biomarkers if x.get("status") in ATTENTION),
-            len(biomarkers),
-            compute_health_score(biomarkers) if is_lab else doc["health_score"],
-            suggestions, report_id)
-        await db.execute(
-            """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
-               values ($1, $2::uuid, $3, $4, $5, $6)""",
-            user_id, report_id, f"biomarker:{b.get('name', '')}", old,
-            {"value": b["value"], "status": b["status"], "tip": b.get("tip"), "explanation": b.get("explanation")},
-            _now())
+        # Advice can take seconds. Re-read under lock after that work so a late
+        # edit cannot erase background verification warnings on OTHER markers.
+        async with db.transaction() as conn:
+            latest = await conn.fetchrow(
+                "select biomarkers, suggestions from reports where id = $1::uuid and user_id = $2 and deleted_at is null for update",
+                report_id, user_id)
+            if not latest:
+                raise HTTPException(status_code=404, detail=MSG_NOT_FOUND)
+            def editable_snapshot(marker):
+                return {k: v for k, v in marker.items() if k not in ("needs_verification", "verification_note")}
+            current = list(latest["biomarkers"] or [])
+            if (req.index >= len(current)
+                    or editable_snapshot(current[req.index]) != editable_snapshot(biomarkers[req.index])
+                    or latest["suggestions"] != doc.get("suggestions")):
+                raise HTTPException(status_code=409, detail="This report changed. Reopen it and try your edit again.")
+            current[req.index] = b
+            await conn.execute(
+                """update reports set biomarkers = $1, normal_count = $2, attention_count = $3,
+                   total_count = $4, health_score = $5, suggestions = $6 where id = $7::uuid""",
+                current,
+                sum(1 for x in current if x.get("status") == BiomarkerStatus.NORMAL),
+                sum(1 for x in current if x.get("status") in ATTENTION),
+                len(current), compute_health_score(current) if is_lab else doc["health_score"],
+                suggestions, report_id)
+            await conn.execute(
+                """insert into report_edits (user_id, report_id, field, old_value, new_value, edited_at)
+                   values ($1, $2::uuid, $3, $4, $5, $6)""",
+                user_id, report_id, f"biomarker:{b.get('name', '')}", old,
+                {"value": b["value"], "status": b["status"], "tip": b.get("tip"), "explanation": b.get("explanation")},
+                _now())
         cache.invalidate_reports(user_id)
         fresh = await self._owned(report_id, user_id)
-        return Report.from_row(fresh).model_dump()
+        out = Report.from_row(fresh).model_dump()
+        out["verification_status"] = (fresh.get("analysis_meta") or {}).get("verification_status", "not_requested")
+        return out
 
     async def _refresh_advice(self, b: dict, suggestions: list[dict], doc: dict, user: dict, report_id: str) -> None:
         """Advice must follow the value. Best-effort: if the model fails, the edit still saves

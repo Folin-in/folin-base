@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class BaseDocument(BaseModel):
@@ -99,15 +99,25 @@ class PreferencesUpdate(BaseModel):
 
 
 class PushTokenRequest(BaseModel):
-    token: str = Field(min_length=20, max_length=256,
-                       pattern=r"^(Exponent|Expo)PushToken\[[A-Za-z0-9_-]+\]$")
+    token: str = Field(min_length=20, max_length=4096,
+                       pattern=r"^[A-Za-z0-9_:\[\]-]+$")
+    provider: Literal["expo", "fcm"] = "expo"
     platform: Literal["android", "ios"]
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
+    @model_validator(mode="after")
+    def validate_provider(self):
+        import re
+        expo = bool(re.fullmatch(r"(Exponent|Expo)PushToken\[[A-Za-z0-9_-]+\]", self.token))
+        if self.provider == "expo" and not expo:
+            raise ValueError("Expected an Expo token")
+        if self.provider == "fcm" and (self.platform != "android" or not re.fullmatch(r"[A-Za-z0-9_:-]+", self.token) or expo):
+            raise ValueError("Expected an Android FCM token")
+        return self
+
 
 class PushTokenDeleteRequest(BaseModel):
-    token: str = Field(min_length=20, max_length=256,
-                       pattern=r"^(Exponent|Expo)PushToken\[[A-Za-z0-9_-]+\]$")
+    token: str = Field(min_length=20, max_length=4096, pattern=r"^[A-Za-z0-9_:\[\]-]+$")
 
 
 PLANS = {"free", "pro"}

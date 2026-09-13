@@ -7,12 +7,14 @@ not enough: the client must re-sweep before declaring the provider unavailable.
 """
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from agents.base import BadModelReply, CallMeta, ModelClient, ModelUnavailable
-from agents.performance import DEFAULT_POLICY, CallPolicy, thinking_config
+from agents.base import BadModelReply, CallMeta, ModelClient, ModelUnavailable, model_order
+from agents.performance import DEFAULT_POLICY, POLICIES, CallPolicy, thinking_config
 from app.enums import TrajectoryKind
 
 _LOOP = asyncio.get_event_loop()
@@ -95,6 +97,46 @@ def test_falls_over_to_second_model_on_503(patch_http):
     assert t.calls == ["model-a", "model-b"]
 
 
+def test_provider_message_saved_and_logged_even_when_fallback_succeeds(patch_http, monkeypatch, caplog):
+    error = httpx.Response(503, json={"error": {
+        "code": 503, "status": "UNAVAILABLE", "message": "The model is overloaded. Please try again later.",
+    }}, request=httpx.Request("POST", "https://x"))
+    t = patch_http([error, _reply(REPLY)])
+    log = AsyncMock()
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(log))
+    assert run(_call(_client())) == REPLY
+    attempt = log.call_args.args[1]["attempts"][0]
+    assert attempt["provider_error"]["status"] == "UNAVAILABLE"
+    assert "overloaded" in attempt["provider_error"]["message"]
+    assert "overloaded" in caplog.text
+    assert t.calls == MODELS
+
+
+def test_provider_secret_not_exposed_in_logs_or_final_exception(patch_http, monkeypatch, caplog):
+    error = httpx.Response(503, json={"error": {
+        "status": "UNAVAILABLE", "message": "Service unavailable for test-key",
+    }}, request=httpx.Request("POST", "https://x?key=test-key"))
+    patch_http([error] * 10)
+    log = AsyncMock()
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(log))
+    with pytest.raises(ModelUnavailable) as exc:
+        run(_call(_client()))
+    assert "test-key" not in str(exc.value)
+    assert "test-key" not in caplog.text
+    assert "test-key" not in json.dumps(log.call_args.args[1]["attempts"])
+
+
+def test_timeout_logging_does_not_invent_provider_response(patch_http, monkeypatch, caplog):
+    patch_http([httpx.ReadTimeout("secret URL or payload"), TimeoutError()])
+    log = AsyncMock()
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(log))
+    with pytest.raises(ModelUnavailable):
+        run(_call(_client()))
+    attempts = log.call_args.args[1]["attempts"]
+    assert all("provider_error" not in a and a["http_status"] is None for a in attempts)
+    assert "secret URL or payload" not in caplog.text
+
+
 # ------------------------------------------------------------------ the retry rounds
 
 def test_retries_after_every_model_503s(patch_http):
@@ -104,10 +146,11 @@ def test_retries_after_every_model_503s(patch_http):
     assert t.calls == ["model-a", "model-b", "model-a"]
 
 
-def test_read_timeout_is_retried_too(patch_http):
+def test_read_timeout_does_not_repeat_the_same_model(patch_http):
     t = patch_http([httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"), _reply(REPLY)])
-    assert run(_call(_client())) == REPLY
-    assert len(t.calls) == 3
+    with pytest.raises(ModelUnavailable):
+        run(_call(_client()))
+    assert t.calls == MODELS
 
 
 def test_gives_up_after_the_round_budget(patch_http):
@@ -174,9 +217,10 @@ def test_connection_reused_and_closed(patch_http):
     run(c.close())
 
 
-def test_stage_specific_effort(patch_http):
+@pytest.mark.parametrize("model", ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"])
+def test_stage_specific_effort(patch_http, model):
     t = patch_http([])
-    c = ModelClient(models=["gemini-3-flash-preview"], api_key="test")
+    c = ModelClient(models=[model], api_key="test")
     for kind in (TrajectoryKind.SCREEN, TrajectoryKind.TRANSCRIBE, TrajectoryKind.ANALYZE, TrajectoryKind.VERIFY):
         run(c.call(system_prompt="s", user_text="t", meta=CallMeta(kind=kind)))
     assert [b["generationConfig"]["thinkingConfig"]["thinkingLevel"] for b in t.bodies] == ["low", "low", "high", "medium"]
@@ -203,3 +247,124 @@ def test_stage_budget_cancels_request(monkeypatch):
     with pytest.raises(ModelUnavailable):
         run(_call(c))
     assert transport.cancelled
+
+
+def test_cooldown_skips_recent_failures_when_healthy_models_exist():
+    assert model_order(MODELS, {"model-a": 99}, 100, cooldown=30) == ["model-b"]
+    assert model_order(MODELS, {"model-a": 99, "model-b": 95}, 100, cooldown=30) == ["model-b", "model-a"]
+    assert model_order(MODELS, {"model-a": 50}, 100, cooldown=30) == MODELS
+
+
+def test_short_passes_allow_three_models_without_repeating_timeouts():
+    for kind in ("screen", "transcribe", "verify"):
+        policy = POLICIES[kind]
+        assert policy.attempt_seconds * 3 <= policy.total_seconds
+        assert policy.retry_rounds == 1
+    assert POLICIES["analyze"].attempt_seconds == 60  # preserve space for full interpretation
+
+
+def test_ai_stage_caps_remain_bounded_without_an_overall_job_deadline():
+    foreground = sum(POLICIES[kind].total_seconds for kind in ("screen", "transcribe", "analyze"))
+    assert POLICIES["analyze"].total_seconds == 120
+    assert foreground == 181
+
+
+@pytest.mark.parametrize("budget", [85, 120])
+def test_two_full_timeouts_leave_third_model_a_fair_attempt(monkeypatch, budget):
+    """Reproduce the failed upload without waiting minutes or calling the provider."""
+    now = [0.0]
+    calls, limits = [], []
+    models = ["model-a", "model-b", "model-c"]
+
+    class Transport:
+        is_closed = False
+        async def post(self, url, **kwargs):
+            model = url.rsplit("/", 1)[-1].split(":")[0]
+            calls.append(model)
+            allowance = kwargs["timeout"].read
+            limits.append(allowance)
+            if model != "model-c":
+                now[0] += allowance
+                raise TimeoutError()
+            now[0] += 1
+            return _reply(REPLY)
+
+    monkeypatch.setattr("agents.base.time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(lambda *a, **kw: _noop()))
+    c = ModelClient(models=models, api_key="test")
+    c._http = Transport()
+    monkeypatch.setattr(c, "policy_for", lambda _: CallPolicy(total_seconds=budget, attempt_seconds=60))
+    assert run(_call(c)) == REPLY
+    assert calls == models
+    assert limits == pytest.approx([budget / 3] * 3)
+    assert now[0] < budget
+
+
+def test_fast_failure_leaves_unused_budget_for_remaining_models(monkeypatch):
+    now = [0.0]
+    limits = []
+
+    class Transport:
+        is_closed = False
+        async def post(self, url, **kwargs):
+            limits.append(kwargs["timeout"].read)
+            if len(limits) == 1:
+                now[0] += 2
+                return _fault(503)
+            if len(limits) == 2:
+                now[0] += limits[-1]
+                raise TimeoutError()
+            return _reply(REPLY)
+
+    monkeypatch.setattr("agents.base.time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(lambda *a, **kw: _noop()))
+    c = ModelClient(models=["a", "b", "c"], api_key="test")
+    c._http = Transport()
+    assert run(c.call(system_prompt="s", user_text="t", meta=CallMeta(kind=TrajectoryKind.ANALYZE))) == REPLY
+    assert limits == pytest.approx([40, 59, 59])
+
+
+@pytest.mark.parametrize("last_succeeds", [True, False])
+def test_real_wall_clock_cancellation_reaches_all_fallbacks(monkeypatch, last_succeeds):
+    calls, cancelled = [], []
+
+    class Transport:
+        is_closed = False
+        async def post(self, url, **kwargs):
+            calls.append(url.rsplit("/", 1)[-1].split(":")[0])
+            if len(calls) == 3 and last_succeeds:
+                return _reply(REPLY)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(calls[-1])
+
+    c = ModelClient(models=["a", "b", "c"], api_key="test")
+    c._http = Transport()
+    monkeypatch.setattr(c, "policy_for", lambda _: CallPolicy(total_seconds=.3, attempt_seconds=.6))
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(lambda *a, **kw: _noop()))
+    if last_succeeds:
+        assert run(_call(c)) == REPLY
+    else:
+        with pytest.raises(ModelUnavailable):
+            run(_call(c))
+    assert calls == ["a", "b", "c"]
+    assert cancelled == (["a", "b"] if last_succeeds else calls)
+
+
+def test_single_healthy_model_keeps_full_per_attempt_allowance(monkeypatch):
+    limits = []
+
+    class Transport:
+        is_closed = False
+        async def post(self, url, **kwargs):
+            limits.append(kwargs["timeout"].read)
+            return _reply(REPLY)
+
+    c = ModelClient(models=["a", "b", "c"], api_key="test")
+    c._http = Transport()
+    c._failed_at = {"a": 99, "b": 99}
+    monkeypatch.setattr("agents.base.time", SimpleNamespace(monotonic=lambda: 100))
+    monkeypatch.setattr(ModelClient, "_log", staticmethod(lambda *a, **kw: _noop()))
+    assert run(c.call(system_prompt="s", user_text="t", meta=CallMeta(kind=TrajectoryKind.ANALYZE))) == REPLY
+    assert limits == [60]

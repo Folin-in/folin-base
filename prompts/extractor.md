@@ -3,7 +3,7 @@ name: extractor
 kind: agent
 description: Turns a medical document into Folin's report JSON.
 model_call: document
-includes: [product_boundary]
+includes: [product_boundary, note_relevance_policy]
 tools: [profile_context, json_extract]
 subagents: []
 output: json
@@ -32,6 +32,9 @@ FIRST photo - never blend results from different documents into one report.
 If only one photo/PDF is attached, set "pages_coherent": true and "pages_issue": null.
 
 COMMON fields (fill what applies, else null):
+  "note_decisions": classify EVERY supplied source_notes index using the source-note
+    relevance policy, AFTER populating the structured detail fields. Return [] if
+    there are no supplied source notes. Do not rewrite source_notes or invent notes.
   "report_type": one of the above
   "patient_name": string or null
   "provider": string or null (hospital / clinic / doctor name)

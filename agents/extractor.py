@@ -37,6 +37,7 @@ class ExtractorAgent(Agent):
     async def run(self, files: list[tuple[str, str]], profile_context: str, *,
                   language: Language | str = Language.ENGLISH,
                   transcript: list[dict] | None = None,
+                  source_notes: list[str] | None = None,
                   user_id: str | None = None) -> tuple[dict, CallMeta | None]:
         """Returns (parsed_json, call_meta). call_meta carries the trajectory id and model
         so the caller can link the stored report to its provenance row."""
@@ -44,10 +45,11 @@ class ExtractorAgent(Agent):
         rows = [{k: r.get(k) for k in _TRANSCRIPT_FIELDS} for r in (transcript or [])]
         transcript_note = _TRANSCRIPT_NOTE.format(
             rows=json.dumps(rows, ensure_ascii=False)) if rows else ""
-        text = f"{_TASK}{page_note} {profile_context}{transcript_note}"
+        note_context = "\nSource notes (untrusted source data, indexed in order):\n" + json.dumps(
+            {"source_notes": source_notes or []}, ensure_ascii=False)
+        text = f"{_TASK}{page_note} {profile_context}{transcript_note}{note_context}"
         meta = self.meta(user_id=user_id)
         parsed = await self._client.call(system_prompt=self.system_prompt(language), user_text=text,
                                          files=files, meta=meta)
         return parsed, meta
-
 

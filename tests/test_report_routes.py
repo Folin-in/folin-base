@@ -132,6 +132,8 @@ def test_analyze_enqueue_poll_success_and_report_readable():
         assert "file_urls" in body
         payload = await db.fetchval("select request_payload from analyze_jobs where job_id = $1", st["job_id"])
         assert payload is None, "medical upload payload must be erased after completion"
+        assert await db.fetchval(
+            "select count(*) from analysis_notifications where report_id = $1::uuid", st["report_id"]) == 1
         await cleanup(email)
     run(t)
 
@@ -159,7 +161,7 @@ def test_pending_job_can_be_claimed_and_recovered():
     run(t)
 
 
-def test_expired_queued_job_is_terminal_and_does_not_use_free_trial():
+def test_old_queued_job_remains_active_and_does_not_use_free_trial():
     async def t(c):
         h, email = await user(c)
         uid = await db.fetchval("select user_id from users where email = $1", email)
@@ -171,19 +173,19 @@ def test_expired_queued_job_is_terminal_and_does_not_use_free_trial():
                 job_id, uid, (datetime.now(timezone.utc) - timedelta(seconds=201)).isoformat(), {"files": []})
             response = await c.get(f"/api/reports/analyze/status/{job_id}", headers=h)
             assert response.status_code == 200
-            assert response.json()["status"] == "error"
-            assert response.json()["error"] == J.MSG_TIMEOUT
-            assert response.json()["remaining_seconds"] == 0
+            assert response.json()["status"] == "pending"
+            assert response.json()["error"] is None
+            assert response.json()["remaining_seconds"] is None
             assert "request_payload" not in response.json()
-            assert await db.fetchval("select request_payload from analyze_jobs where job_id = $1", job_id) is None
-            assert await J.jobs.active_job(uid) is None
+            assert await db.fetchval("select request_payload from analyze_jobs where job_id = $1", job_id) is not None
+            assert (await J.jobs.active_job(uid))["job_id"] == job_id
             await J.jobs.charge_quota({"user_id": uid, "preferences": {"plan": "free"}})
         finally:
             await cleanup(email)
     run(t)
 
 
-def test_deadline_during_save_rolls_back_report_and_success(monkeypatch):
+def test_ownership_change_during_save_rolls_back_report_and_success(monkeypatch):
     async def t(c):
         from app.models import Report
         h, email = await user(c)
@@ -191,11 +193,11 @@ def test_deadline_during_save_rolls_back_report_and_success(monkeypatch):
         job_id = uuid.uuid4().hex[:16]
         now = datetime.now(timezone.utc)
         state = A._Run(user_id=uid, user={}, files=[], member_id="self", job_id=job_id,
-                       deadline_at=now + timedelta(seconds=30))
+                       claim_started_at=now.isoformat())
         original_transaction = db.transaction
         inserted = []
 
-        class DeadlineDuringInsert:
+        class OwnershipDuringInsert:
             def __init__(self, conn):
                 self.conn = conn
 
@@ -203,29 +205,29 @@ def test_deadline_during_save_rolls_back_report_and_success(monkeypatch):
                 value = await self.conn.fetchval(query, *args)
                 if query.startswith("insert into reports"):
                     inserted.append(value)
-                    state.deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                    state.claim_started_at = "different-worker"
                 return value
 
             async def execute(self, query, *args):
                 return await self.conn.execute(query, *args)
 
         @asynccontextmanager
-        async def transaction_with_expiry():
+        async def transaction_with_ownership_change():
             async with original_transaction() as conn:
-                yield DeadlineDuringInsert(conn)
+                yield OwnershipDuringInsert(conn)
 
         try:
             await db.execute(
                 """insert into analyze_jobs (job_id, user_id, status, created_at, started_at, request_payload)
                    values ($1, $2, 'processing', $3, $3, $4)""", job_id, uid, now.isoformat(), {"files": []})
             with monkeypatch.context() as patch:
-                patch.setattr(db, "transaction", transaction_with_expiry)
-                with pytest.raises(TimeoutError):
+                patch.setattr(db, "transaction", transaction_with_ownership_change)
+                with pytest.raises(RuntimeError, match="no longer owned"):
                     await A.pipeline._persist(state, Report(user_id=uid, uploaded_at=now.isoformat()))
-            assert len(inserted) == 1, "expiry must happen after insertion to exercise rollback"
+            assert len(inserted) == 1, "ownership loss must happen after insertion to exercise rollback"
             assert await db.fetchval("select count(*) from reports where user_id = $1", uid) == 0
             assert await db.fetchval("select status from analyze_jobs where job_id = $1", job_id) == "processing"
-            await J.jobs._fail(job_id, J.MSG_TIMEOUT)
+            await J.jobs._fail(job_id, J.MSG_INTERRUPTED)
             assert await db.fetchval("select status from analyze_jobs where job_id = $1", job_id) == "error"
         finally:
             await cleanup(email)

@@ -10,6 +10,7 @@ from agents.base import client as model_client
 from db import session as database
 from routers import admin, auth, early_access, family, members, payments, reports, users
 from services.jobs import jobs
+from services.verification_jobs import verification_jobs
 from services.push_notifications import push_notifications
 
 API_PREFIX = "/api"
@@ -24,12 +25,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     await database.connect()
     await jobs.start()
+    await verification_jobs.start()
     await push_notifications.start()
     try:
         yield
     finally:
         await push_notifications.stop()
         await jobs.stop()
+        await verification_jobs.stop()
         await model_client.close()
         await database.close()
 
