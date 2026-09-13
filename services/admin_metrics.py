@@ -223,5 +223,64 @@ class AdminMetricsService:
                 "reports": await self.reports(),
                 "payments": await self.payments()}
 
+    async def user_details_list(self, search: str = "", plan: str = "", limit: int = 50, offset: int = 0) -> dict:
+        """Detailed list of users with email, provider, plan, login times, and API usage stats."""
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+
+        clauses = []
+        args = []
+        idx = 1
+        if search.strip():
+            term = f"%{search.strip().lower()}%"
+            args.append(term)
+            clauses.append(f"(lower(u.email) like ${idx} or lower(coalesce(u.username, '')) like ${idx} or lower(coalesce(u.name, '')) like ${idx} or u.user_id = ${idx})")
+            idx += 1
+        if plan.strip() and plan.strip() in ("free", "pro"):
+            args.append(plan.strip().lower())
+            clauses.append(f"coalesce(u.preferences->>'plan', 'free') = ${idx}")
+            idx += 1
+
+        where_str = f"where {' and '.join(clauses)}" if clauses else ""
+
+        count_sql = f"select count(*) from users u {where_str}"
+        total = await db.fetchval(count_sql, *args) or 0
+
+        query = f"""
+            select 
+                u.user_id,
+                u.email,
+                u.username,
+                u.name,
+                u.auth_provider,
+                coalesce(u.preferences->>'plan', 'free') as plan,
+                u.preferences->>'plan_expires_at' as plan_expires_at,
+                u.created_at,
+                (select max(r.created_at) from refresh_tokens r where r.user_id = u.user_id) as last_seen,
+                (select count(*) from reports rep where rep.user_id = u.user_id and rep.deleted_at is null) as reports_count,
+                (select count(*) from analyze_jobs j where j.user_id = u.user_id) as api_calls_count,
+                (select count(*) from ai_trajectories t where t.user_id = u.user_id) as ai_model_calls
+            from users u
+            {where_str}
+            order by coalesce((select max(r.created_at) from refresh_tokens r where r.user_id = u.user_id)::text, u.created_at) desc
+            limit {int(limit)} offset {int(offset)}
+        """
+        rows = await db.fetch(query, *args)
+
+        user_list = []
+        for r in rows:
+            d = dict(r)
+            if d.get("last_seen") and hasattr(d["last_seen"], "isoformat"):
+                d["last_seen"] = d["last_seen"].isoformat()
+            user_list.append(d)
+
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "users": user_list,
+        }
+
 
 admin_metrics = AdminMetricsService()
+

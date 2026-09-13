@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Folin Admin</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   /* Spacing and radii follow the product's golden-ratio scale: 8 / 13 / 21 / 34 / 55. */
   :root{
@@ -114,8 +115,9 @@
     <h1>folin <span>admin</span></h1>
     <select id="window" onchange="load()" aria-label="Time window"></select>
     <button onclick="load()">Refresh</button>
+    <span id="realtimeBadge" class="pill p-ok" style="font-size:11px;cursor:pointer" title="Realtime sync active">● Realtime Live</span>
     <label class="sub" style="display:flex;align-items:center;gap:6px;cursor:pointer">
-      <input type="checkbox" id="auto" style="width:auto;margin:0" onchange="setAuto()"> auto
+      <input type="checkbox" id="auto" style="width:auto;margin:0" onchange="setAuto()" checked> auto
     </label>
     <div class="spacer"></div>
     <span id="stamp" class="sub"></span>
@@ -133,8 +135,10 @@ const KEY = "folin_admin_token";
 // The page is served at <prefix>/admin, so strip that to recover the prefix. A bare
 // relative fetch resolves against <prefix>/ and silently misses the admin segment.
 const BASE = location.pathname.replace(/\/admin\/?$/, "");
-const AUTO_MS = 60000;
+const AUTO_MS = 5000;
 let token = "", timer = null, lastSeries = null;
+let currentUserPage = 1, userTotalCount = 0, userLimit = 25, userSearchDebounce = null;
+let realtimeInitialized = false;
 addEventListener("resize", () => { if (lastSeries) drawChart(lastSeries); });
 try { token = localStorage.getItem(KEY) || ""; } catch (e) {}
 
@@ -374,11 +378,197 @@ function render(d){
     </div>
   </section>`;
 
-  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent + grantPro;
+  const usersSection = `<section>
+    <div style="display:flex;align-items:center;gap:var(--s13);margin-bottom:var(--s13);flex-wrap:wrap">
+      <h2 style="margin:0">All Users &amp; API Usage (<span id="userTotal">...</span>)</h2>
+      <div class="spacer"></div>
+      <div style="display:flex;gap:var(--s8);align-items:center;flex-wrap:wrap">
+        <input id="userSearch" type="text" placeholder="Search email, username, name..." 
+               style="min-width:220px;padding:5px 10px;font-size:13px" oninput="debounceUserSearch()">
+        <select id="userPlanFilter" onchange="loadUsers(1)" style="padding:5px 10px;font-size:13px">
+          <option value="">All Plans</option>
+          <option value="pro">Pro Only</option>
+          <option value="free">Free Only</option>
+        </select>
+        <button onclick="loadUsers(currentUserPage)" style="padding:5px 10px;font-size:13px">Refresh</button>
+      </div>
+    </div>
+    <div class="card scroll" style="padding:0">
+      <table id="usersTable">
+        <thead>
+          <tr>
+            <th>Email &amp; User</th>
+            <th>Provider</th>
+            <th>Plan</th>
+            <th>Registered</th>
+            <th>Last Active</th>
+            <th class="num">Reports</th>
+            <th class="num">API Calls</th>
+            <th class="num">AI Model Calls</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="usersListBody">
+          <tr><td colspan="9" style="text-align:center;padding:var(--s21);color:var(--muted)">Loading users...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:var(--s8);font-size:12px;color:var(--muted)">
+      <span id="userPaginationInfo">Showing 0-0 of 0</span>
+      <div style="display:flex;gap:var(--s8)">
+        <button id="btnPrevPage" onclick="prevUserPage()" disabled style="padding:4px 10px">← Prev</button>
+        <button id="btnNextPage" onclick="nextUserPage()" disabled style="padding:4px 10px">Next →</button>
+      </div>
+    </div>
+  </section>`;
+
+  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent + usersSection + grantPro;
   $("stamp").textContent = "updated " + new Date(d.generated_at).toLocaleTimeString();
   drawChart(d.timeseries);
   lastSeries = d.timeseries;
   wireTips();
+  loadUsers(currentUserPage, true);
+  initRealtime();
+}
+
+function debounceUserSearch(){
+  clearTimeout(userSearchDebounce);
+  userSearchDebounce = setTimeout(() => loadUsers(1), 300);
+}
+
+function prevUserPage(){
+  if (currentUserPage > 1) loadUsers(currentUserPage - 1);
+}
+
+function nextUserPage(){
+  if (currentUserPage * userLimit < userTotalCount) loadUsers(currentUserPage + 1);
+}
+
+function quickGrantPro(identifier){
+  const idEl = $("proIdentifier");
+  if (idEl) {
+    idEl.value = identifier;
+    idEl.scrollIntoView({ behavior: "smooth" });
+    idEl.focus();
+  }
+}
+
+async function loadUsers(page = 1, silent = false){
+  currentUserPage = page;
+  const tbody = $("usersListBody");
+  if (!tbody) return;
+  if (!silent) tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:var(--s13);color:var(--muted)">Loading users...</td></tr>`;
+
+  const search = $("userSearch") ? $("userSearch").value.trim() : "";
+  const plan = $("userPlanFilter") ? $("userPlanFilter").value.trim() : "";
+
+  try {
+    const res = await fetch(`${BASE}/admin/users?search=${encodeURIComponent(search)}&plan=${encodeURIComponent(plan)}&page=${page}&limit=${userLimit}`, {
+      headers: { Authorization: "Bearer " + token }
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    userTotalCount = data.total;
+
+    if ($("userTotal")) $("userTotal").textContent = num(data.total);
+    if ($("userPaginationInfo")) {
+      const from = data.total ? (page - 1) * userLimit + 1 : 0;
+      const to = Math.min(page * userLimit, data.total);
+      $("userPaginationInfo").textContent = `Showing ${from}-${to} of ${num(data.total)} users`;
+    }
+    if ($("btnPrevPage")) $("btnPrevPage").disabled = page <= 1;
+    if ($("btnNextPage")) $("btnNextPage").disabled = page * userLimit >= data.total;
+
+    if (!data.users.length) {
+      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:var(--s21);color:var(--muted)">No users found matching query.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = data.users.map(u => {
+      const isPro = u.plan === "pro";
+      const planPill = isPro
+        ? `<span class="pill p-ok">PRO</span>${u.plan_expires_at ? ` <span class="sub">${esc(u.plan_expires_at.slice(0, 10))}</span>` : ""}`
+        : `<span class="pill p-flat">FREE</span>`;
+      const providerPill = `<span class="pill ${u.auth_provider === 'google' ? 'p-ok' : u.auth_provider === 'apple' ? 'p-warn' : 'p-flat'}">${esc(u.auth_provider)}</span>`;
+      const lastActive = u.last_seen ? esc(u.last_seen.slice(0, 16).replace("T", " ")) : (u.created_at ? esc(u.created_at.slice(0, 10)) : "—");
+      const regDate = u.created_at ? esc(u.created_at.slice(0, 10)) : "—";
+      const action = isPro
+        ? `<span class="sub" style="color:var(--good);font-weight:600">✓ Active</span>`
+        : `<button onclick="quickGrantPro('${esc(u.email || u.username || u.user_id)}')" style="padding:3px 8px;font-size:11px">Grant Pro</button>`;
+
+      return `<tr>
+        <td>
+          <div style="font-weight:600">${esc(u.email)}</div>
+          <div class="sub mono">${esc(u.username ? '@' + u.username : u.user_id)}${u.name ? ' · ' + esc(u.name) : ''}</div>
+        </td>
+        <td>${providerPill}</td>
+        <td>${planPill}</td>
+        <td class="sub">${regDate}</td>
+        <td class="sub">${lastActive}</td>
+        <td class="num">${num(u.reports_count)}</td>
+        <td class="num" style="font-weight:600">${num(u.api_calls_count)}</td>
+        <td class="num">${num(u.ai_model_calls)}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join("");
+  } catch (e) {
+    if (!silent) tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--bad)">Error loading users: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function initRealtime(){
+  if (realtimeInitialized) return;
+  realtimeInitialized = true;
+  try {
+    const res = await fetch(`${BASE}/admin/realtime-config`, {
+      headers: { Authorization: "Bearer " + token }
+    });
+    if (!res.ok) return;
+    const cfg = await res.json();
+    if (window.supabase && cfg.supabase_url && cfg.supabase_anon_key) {
+      supabaseClient = window.supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key);
+      supabaseClient.channel('admin-realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, () => {
+          flashRealtime();
+          load(true);
+          loadUsers(currentUserPage, true);
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'analyze_jobs' }, () => {
+          flashRealtime();
+          load(true);
+          loadUsers(currentUserPage, true);
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'reports' }, () => {
+          flashRealtime();
+          load(true);
+          loadUsers(currentUserPage, true);
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            const badge = $("realtimeBadge");
+            if (badge) { badge.className = "pill p-ok"; badge.innerHTML = "● Supabase Realtime: Active"; }
+          }
+        });
+    }
+  } catch (e) {
+    console.log("Realtime init fallback", e);
+  }
+}
+
+function flashRealtime(){
+  const badge = $("realtimeBadge");
+  if (!badge) return;
+  badge.className = "pill p-warn";
+  badge.textContent = "● Syncing...";
+  setTimeout(() => {
+    badge.className = "pill p-ok";
+    badge.textContent = "● Realtime Live";
+  }, 1000);
+}
+
+function setAuto(){
+  clearInterval(timer);
+  timer = $("auto").checked ? setInterval(() => { load(true); loadUsers(currentUserPage, true); }, AUTO_MS) : null;
 }
 
 async function doGrantPro(){
@@ -401,6 +591,7 @@ async function doGrantPro(){
       msgEl.style.color = "var(--good)";
       msgEl.textContent = `✅ Successfully granted Pro for ${days} days to ${d.user.email || d.user.username} (User ID: ${d.user.user_id}, expires: ${d.user.plan_expires_at.slice(0, 10)})`;
       idEl.value = "";
+      loadUsers(currentUserPage, true);
     } else {
       msgEl.style.color = "var(--bad)";
       msgEl.textContent = `❌ ${d.detail || "Failed to grant Pro"}`;
@@ -413,7 +604,7 @@ async function doGrantPro(){
   }
 }
 
-async function load(){
+async function load(silent = false){
   if (!token) { $("gate").classList.remove("hide"); $("app").classList.add("hide"); return; }
   const sel = $("window"), win = sel.value || "7d";
   try {
@@ -432,12 +623,16 @@ async function load(){
     $("gate").classList.add("hide"); $("app").classList.remove("hide");
     render(d);
   } catch (e) {
-    $("gateErr").textContent = "Could not load metrics: " + e.message;
-    $("gate").classList.remove("hide");
+    if (!silent) {
+      $("gateErr").textContent = "Could not load metrics: " + e.message;
+      $("gate").classList.remove("hide");
+    }
   }
 }
 
 load();
+setAuto();
 </script>
 </body>
 </html>
+

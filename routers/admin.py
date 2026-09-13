@@ -54,3 +54,25 @@ async def grant_pro(req: GrantProRequest,
     """Grant Pro access to a user. Strictly gated to authorized admin IPs."""
     return await users.grant_pro(req.identifier, req.days)
 
+
+@router.get("/users")
+async def get_admin_users(search: str = Query(default=""),
+                          plan: str = Query(default=""),
+                          page: int = Query(default=1, ge=1),
+                          limit: int = Query(default=50, ge=1, le=200),
+                          _: dict = Depends(get_admin_user)):
+    """Paginated list of all users with login activity, plan, and API usage stats."""
+    offset = (page - 1) * limit
+    return await admin_metrics.user_details_list(search=search, plan=plan, limit=limit, offset=offset)
+
+
+@router.get("/realtime-config")
+async def get_realtime_config(_: dict = Depends(get_admin_user)):
+    """Supabase Realtime configuration for the admin dashboard."""
+    import os
+    return {
+        "supabase_url": settings.supabase_url,
+        "supabase_anon_key": os.environ.get("SUPABASE_ANON_KEY", ""),
+    }
+
+

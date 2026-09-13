@@ -135,3 +135,46 @@ def test_user_service_grant_pro_validation():
         asyncio.run(user_mod.users.grant_pro("user@example.com", 0))
     assert exc.value.status_code == 400
 
+
+def test_api_users_list_endpoint(monkeypatch):
+    from unittest.mock import AsyncMock
+    from starlette.testclient import TestClient
+    from app.main import app
+    from core.security import get_admin_user
+    import services.admin_metrics as metrics_mod
+
+    mock_users = AsyncMock(return_value={
+        "total": 1,
+        "limit": 50,
+        "offset": 0,
+        "users": [{
+            "user_id": "u1",
+            "email": "test@example.com",
+            "username": "test",
+            "name": "Test",
+            "auth_provider": "local",
+            "plan": "free",
+            "plan_expires_at": None,
+            "created_at": "2026-09-01T00:00:00",
+            "last_seen": "2026-09-13T00:00:00",
+            "reports_count": 1,
+            "api_calls_count": 2,
+            "ai_model_calls": 5,
+        }]
+    })
+    monkeypatch.setattr(metrics_mod.admin_metrics, "user_details_list", mock_users)
+
+    app.dependency_overrides[get_admin_user] = lambda: {"email": "admin@example.com"}
+    try:
+        client = TestClient(app)
+        res = client.get("/api/admin/users?search=test")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["total"] == 1
+        assert data["users"][0]["email"] == "test@example.com"
+        assert data["users"][0]["api_calls_count"] == 2
+    finally:
+        app.dependency_overrides.clear()
+
+
+
