@@ -53,6 +53,13 @@ for r in (auth.router, reports.router, users.router, family.router, members.rout
 
 app.include_router(api_router)
 
+
+@app.get("/admin", include_in_schema=False)
+async def admin_shortcut():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/api/admin")
+
+
 # A wildcard origin cannot carry credentials (browsers refuse it); production sets the exact origin.
 app.add_middleware(
     CORSMiddleware,
