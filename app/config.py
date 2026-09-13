@@ -108,6 +108,7 @@ class Settings:
     # --- network
     cors_allowed_origins: list[str]
     admin_emails: list[str]
+    admin_allowed_ips: list[str] = field(default_factory=list)
     trusted_proxy_ips: frozenset[str] = field(default_factory=frozenset)
 
     @property
@@ -167,6 +168,7 @@ def _load() -> Settings:
         pro_price_inr=_int("PRO_PRICE_INR"),
         allow_self_serve_pro=_bool("ALLOW_SELF_SERVE_PRO"),
         admin_emails=[e.lower() for e in _csv("ADMIN_EMAILS", required=False)],
+        admin_allowed_ips=_csv("ADMIN_ALLOWED_IPS", required=False),
         google_play_package_name=os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "com.folin.app").strip(),
         google_play_pro_product_id=os.environ.get("GOOGLE_PLAY_PRO_PRODUCT_ID", "").strip(),
         google_play_pro_base_plan_id=os.environ.get("GOOGLE_PLAY_PRO_BASE_PLAN_ID", "").strip(),

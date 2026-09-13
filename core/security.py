@@ -3,6 +3,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_address, ip_network
 from typing import Optional
 
 import bcrypt
@@ -196,3 +197,77 @@ async def get_admin_user(request: Request) -> dict:
     if (user.get("email") or "").lower() not in settings.admin_emails:
         raise HTTPException(status_code=404, detail="Not found")
     return user
+
+
+# ---------- IP Gating ----------
+def get_client_ip(request: Request) -> str:
+    """Extract real client IP address, handling Cloudflare, Render, and local proxies.
+
+    Cloudflare edge servers strip and overwrite CF-Connecting-IP, making it the most
+    reliable header when running behind Cloudflare or Render (which sits behind Cloudflare).
+    """
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip and cf_ip.strip():
+        return cf_ip.strip()
+
+    try:
+        from core.rate_limit import _client_ip
+        ip = _client_ip(request)
+        if ip and ip != "unknown":
+            return ip
+    except Exception:
+        pass
+
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+
+    if request.client and request.client.host:
+        return request.client.host.strip()
+
+    return "unknown"
+
+
+def is_ip_allowed(client_ip: str, allowed_list: list[str]) -> bool:
+    """Check if client_ip matches an allowed exact IP, CIDR block, or local interface."""
+    if not client_ip or client_ip == "unknown":
+        return False
+
+    if client_ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return True
+
+    try:
+        c_addr = ip_address(client_ip)
+    except ValueError:
+        return client_ip in allowed_list
+
+    for entry in allowed_list:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if c_addr in ip_network(entry, strict=False):
+                    return True
+            else:
+                if c_addr == ip_address(entry):
+                    return True
+        except ValueError:
+            if client_ip == entry:
+                return True
+    return False
+
+
+async def require_admin_ip(request: Request) -> str:
+    """Dependency that strictly gates access to allowed admin IPs."""
+    client_ip = get_client_ip(request)
+    if not is_ip_allowed(client_ip, settings.admin_allowed_ips):
+        logger.warning("Rejected admin action from unauthorized IP: %s", client_ip)
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: IP {client_ip} is not authorized for this action.",
+        )
+    return client_ip
+

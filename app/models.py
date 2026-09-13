@@ -322,3 +322,10 @@ class GooglePlayRtdnMessage(BaseModel):
 
 class GooglePlayRtdnEnvelope(BaseModel):
     message: GooglePlayRtdnMessage
+
+
+# ---------- Admin bodies ----------
+class GrantProRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=128, description="Email, username, or user_id")
+    days: int = Field(default=365, ge=1, le=3650, description="Duration in days (default: 365)")
+

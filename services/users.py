@@ -249,6 +249,65 @@ class UserService:
             "select action, plan, amount_inr, starts_at, expires_at, created_at from plan_history "
             "where user_id = $1 order by created_at desc limit $2", user_id, PLAN_HISTORY_LIMIT)
 
+    async def grant_pro(self, identifier: str, days: int = 365) -> dict:
+        clean_id = (identifier or "").strip()
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="identifier is required (email, username, or user_id)")
+        if days < 1:
+            raise HTTPException(status_code=400, detail="days must be at least 1")
+
+        user = await db.fetchrow(
+            """
+            select user_id, email, username, name, preferences
+            from users
+            where lower(email) = lower($1) or lower(username) = lower($1) or user_id = $1
+            """,
+            clean_id,
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User '{clean_id}' not found")
+
+        now = _now()
+        now_iso = now.isoformat()
+        expires_at = (now + timedelta(days=days)).isoformat()
+
+        prefs = dict(user.get("preferences") or {})
+        prefs.update({
+            "plan": "pro",
+            "plan_changed_at": now_iso,
+            "plan_expires_at": expires_at,
+        })
+
+        await db.execute(
+            "update users set preferences = $1 where user_id = $2",
+            prefs,
+            user["user_id"],
+        )
+        await db.execute(
+            """
+            insert into plan_history (user_id, action, plan, amount_inr, starts_at, expires_at, created_at)
+            values ($1, 'upgraded', 'pro', null, $2, $3, $2)
+            """,
+            user["user_id"],
+            now_iso,
+            expires_at,
+        )
+        cache.invalidate(user["user_id"])
+
+        return {
+            "ok": True,
+            "message": f"Successfully granted Pro for {days} days",
+            "user": {
+                "user_id": user["user_id"],
+                "email": user["email"],
+                "username": user.get("username"),
+                "name": user.get("name") or "",
+                "plan": "pro",
+                "plan_expires_at": expires_at,
+            },
+        }
+
+
     # ------------------------------------------------------------ export / delete
 
     @staticmethod

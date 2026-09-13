@@ -362,11 +362,55 @@ function render(d){
       <td class="sub">${esc(r.error || "—")}</td>`)}
   </section>`;
 
-  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent;
+  const grantPro = `<section><h2>Grant Pro Plan</h2>
+    <div class="card" style="max-width:580px">
+      <p class="sub" style="margin-top:0">Grant Pro access directly to any account (email, username, or user_id). Restricted to authorized admin IP.</p>
+      <div style="display:flex;gap:var(--s8);flex-wrap:wrap">
+        <input id="proIdentifier" type="text" placeholder="Email, username, or user_id" style="flex:2;min-width:200px">
+        <input id="proDays" type="number" value="365" min="1" max="3650" style="width:90px" title="Duration in days">
+        <button class="primary" id="btnGrantPro" onclick="doGrantPro()">Grant Pro</button>
+      </div>
+      <div id="proMsg" style="margin-top:var(--s8);font-size:13px;display:none"></div>
+    </div>
+  </section>`;
+
+  $("body").innerHTML = head + trend + modelHealth + twoUp + breakdown + quality + recent + grantPro;
   $("stamp").textContent = "updated " + new Date(d.generated_at).toLocaleTimeString();
   drawChart(d.timeseries);
   lastSeries = d.timeseries;
   wireTips();
+}
+
+async function doGrantPro(){
+  const idEl = $("proIdentifier"), daysEl = $("proDays"), msgEl = $("proMsg"), btn = $("btnGrantPro");
+  const identifier = idEl.value.trim();
+  const days = parseInt(daysEl.value, 10) || 365;
+  if (!identifier) { alert("Please enter an email, username, or user_id"); return; }
+  btn.disabled = true;
+  msgEl.style.display = "block";
+  msgEl.style.color = "var(--muted)";
+  msgEl.textContent = "Granting Pro access...";
+  try {
+    const res = await fetch(`${BASE}/admin/grant-pro`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier, days })
+    });
+    const d = await res.json();
+    if (res.ok) {
+      msgEl.style.color = "var(--good)";
+      msgEl.textContent = `✅ Successfully granted Pro for ${days} days to ${d.user.email || d.user.username} (User ID: ${d.user.user_id}, expires: ${d.user.plan_expires_at.slice(0, 10)})`;
+      idEl.value = "";
+    } else {
+      msgEl.style.color = "var(--bad)";
+      msgEl.textContent = `❌ ${d.detail || "Failed to grant Pro"}`;
+    }
+  } catch (e) {
+    msgEl.style.color = "var(--bad)";
+    msgEl.textContent = `❌ Network error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function load(){
