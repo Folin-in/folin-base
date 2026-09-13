@@ -23,6 +23,16 @@ _ready = False
 ADMIN_EMAIL = "admin_probe@example.com"
 
 
+@pytest.fixture(autouse=True)
+def cleanup_probe_users():
+    yield
+    async def _clean():
+        if _ready:
+            await db.execute("delete from refresh_tokens where user_id in (select user_id from users where name = 'Admin Probe')")
+            await db.execute("delete from users where name = 'Admin Probe'")
+    _LOOP.run_until_complete(_clean())
+
+
 def run(coro):
     async def w():
         global _ready
